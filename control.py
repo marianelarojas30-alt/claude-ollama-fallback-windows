@@ -160,8 +160,11 @@ def _hook_configured() -> tuple[bool, str]:
         return False, f"settings unreadable: {exc}"
     hooks = data.get("hooks", {})
     marker = str(runtime.install_dir() / "supervisor_hook.py")
+    # json.dumps escapes Windows backslashes. Compare against the JSON-escaped
+    # representation of the path instead of the raw C:\... string.
+    escaped_marker = json.dumps(marker)[1:-1]
     required = ("StopFailure", "Stop", "UserPromptSubmit")
-    missing = [event for event in required if marker not in json.dumps(hooks.get(event, []))]
+    missing = [event for event in required if escaped_marker not in json.dumps(hooks.get(event, []))]
     if missing:
         return False, "missing hook events: " + ", ".join(missing)
     return True, "StopFailure, Stop and UserPromptSubmit configured"
