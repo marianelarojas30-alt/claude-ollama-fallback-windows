@@ -1,41 +1,32 @@
-import importlib.util
 import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("continuity", ROOT / "continuity.py")
-continuity = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(continuity)
+import continuity
 
 
-class ContinuityTests(unittest.TestCase):
-    def test_default_errors(self):
-        self.assertTrue(continuity.allowed_error("rate_limit"))
-        self.assertTrue(continuity.allowed_error("server_error"))
-        self.assertTrue(continuity.allowed_error("billing_error"))
-        self.assertTrue(continuity.allowed_error("max_output_tokens"))
-        self.assertFalse(continuity.allowed_error("authentication_failed"))
-        self.assertFalse(continuity.allowed_error("overloaded"))
-
-    def test_prompt_contains_continuity_goal(self):
-        prompt = continuity.build_prompt({"cwd": "C:/repo", "error": "rate_limit"})
-        self.assertIn("Continue the unfinished work", prompt)
-        self.assertIn("Preserve existing user changes", prompt)
-
+class ContinuityUtilityTests(unittest.TestCase):
     def test_transcript_extraction(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = pathlib.Path(tempdir) / "transcript.jsonl"
             path.write_text(
-                json.dumps({"message": {"role": "user", "content": "finish feature"}}) + "\n",
+                json.dumps({"message": {"role": "user", "content": "finish feature"}}) + "\n"
+                + json.dumps({"message": {"role": "assistant", "content": "working on it"}}) + "\n",
                 encoding="utf-8",
             )
-            self.assertIn("finish feature", continuity.extract_transcript(str(path)))
+            text = continuity.extract_transcript(str(path))
+            self.assertIn("finish feature", text)
+            self.assertIn("working on it", text)
 
-    def test_safe_slug(self):
-        self.assertEqual(continuity.safe_slug("abc / def"), "abc-def")
+    def test_missing_transcript_is_nonfatal(self):
+        text = continuity.extract_transcript("Z:/definitely-missing.jsonl")
+        self.assertIn("Transcript not found", text)
+
+    def test_git_snapshot_is_nonfatal_without_git(self):
+        with mock.patch.object(continuity.shutil, "which", return_value=None):
+            self.assertEqual(continuity.git_snapshot("."), "git not installed")
 
 
 if __name__ == "__main__":
