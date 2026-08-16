@@ -26,7 +26,7 @@ class SupervisorBehaviorTests(unittest.TestCase):
                 primary.assert_called_once()
                 fallback.assert_not_called()
 
-    def test_fallback_readiness_requires_ollama_only_when_called(self):
+    def test_fallback_readiness_checks_ollama_only_when_needed(self):
         with mock.patch.object(supervisor.runtime, "ollama_available", return_value=(False, "missing")), \
              mock.patch.object(supervisor.runtime, "model_available") as model:
             ok, detail = supervisor.fallback_readiness("qwen3.5")
@@ -34,29 +34,33 @@ class SupervisorBehaviorTests(unittest.TestCase):
             self.assertEqual(detail, "missing")
             model.assert_not_called()
 
-    def test_primary_environment_clears_ollama_provider_variables(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            control_dir = pathlib.Path(tempdir)
-            with mock.patch.dict(os.environ, {
-                "ANTHROPIC_AUTH_TOKEN": "ollama",
-                "ANTHROPIC_API_KEY": "",
-                "ANTHROPIC_BASE_URL": "http://localhost:11434",
-            }, clear=False), mock.patch.object(runtime, "real_claude_executable", return_value="C:/claude.exe"), mock.patch.object(runtime, "ollama_executable", return_value="C:/ollama.exe"):
-                env = runtime.primary_environment(control_dir)
-                self.assertNotEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "ollama")
-                self.assertNotIn("ANTHROPIC_BASE_URL", env)
-                self.assertEqual(env["CLAUDE_CONTINUITY_PROVIDER"], "anthropic")
+    def test_probe_marks_itself_so_hooks_cannot_overwrite_session(self):
+        stop = mock.Mock()
+        stop.wait.side_effect = [False, True]
+        completed = mock.Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as tempdir, \
+             mock.patch.object(supervisor.runtime, "state_dir", return_value=pathlib.Path(tempdir)), \
+             mock.patch.object(supervisor, "real_claude", return_value="claude.exe"), \
+             mock.patch.object(supervisor, "child_env", return_value={}), \
+             mock.patch.object(supervisor.subprocess, "run", return_value=completed) as run:
+            supervisor.probe_primary(pathlib.Path(tempdir), stop)
+            env = run.call_args.kwargs["env"]
+            self.assertEqual(env["CLAUDE_CONTINUITY_PROBE"], "1")
 
-    def test_control_ignores_stale_supervisor_directories(self):
-        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
-            root = control.state_dir() / "supervisor"
-            stale = root / "111"
-            live = root / "222"
-            stale.mkdir(parents=True)
-            live.mkdir(parents=True)
-            (stale / "heartbeat.json").write_text(json.dumps({"epoch": time.time() - 60}), encoding="utf-8")
-            (live / "heartbeat.json").write_text(json.dumps({"epoch": time.time()}), encoding="utf-8")
-            self.assertEqual(control.active_control(), live)
+    def test_fast_primary_exit_still_consumes_stopfailure_signal(self):
+        request = {"session_id": "abc", "error": "rate_limit"}
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = 1
+        fake_proc.returncode = 1
+        with tempfile.TemporaryDirectory() as tempdir, \
+             mock.patch.object(supervisor, "build_primary_command", return_value=["claude.exe"]), \
+             mock.patch.object(supervisor, "spawn_visible", return_value=fake_proc), \
+             mock.patch.object(supervisor, "fallback_from_signal", side_effect=[(request, "abc")]):
+            action, payload, session, code = supervisor.run_primary(tempdir, pathlib.Path(tempdir), None, [])
+            self.assertEqual(action, "fallback")
+            self.assertEqual(payload["error"], "rate_limit")
+            self.assertEqual(session, "abc")
+            self.assertEqual(code, 0)
 
     def test_ollama_command_never_resumes_anthropic_session(self):
         with mock.patch.object(supervisor, "real_claude", return_value="C:/claude.exe"):
@@ -66,38 +70,64 @@ class SupervisorBehaviorTests(unittest.TestCase):
         self.assertNotIn("--resume", cmd)
         self.assertIn("handoff prompt", cmd)
 
-    def test_primary_resume_uses_original_session_and_handback(self):
+    def test_primary_resume_uses_only_original_anthropic_session(self):
         with mock.patch.object(supervisor, "real_claude", return_value="C:/claude.exe"):
-            cmd = supervisor.build_primary_command("anthropic-session-123", [], "fallback finished")
-        self.assertEqual(cmd[:3], ["C:/claude.exe", "--resume", "anthropic-session-123"])
+            cmd = supervisor.build_primary_command("anthropic-123", [], "fallback finished")
+        self.assertEqual(cmd[:3], ["C:/claude.exe", "--resume", "anthropic-123"])
         self.assertEqual(cmd[-1], "fallback finished")
         self.assertNotIn("qwen3.5", cmd)
 
-    def test_fallback_prompt_uses_transcript_and_repo_not_resume(self):
-        with mock.patch.object(supervisor.continuity, "extract_transcript", return_value="RECENT CHAT"), \
-             mock.patch.object(supervisor.continuity, "git_snapshot", return_value="GIT STATE"):
-            prompt = supervisor.fallback_prompt("C:/repo", {
-                "error": "rate_limit",
-                "error_details": "429",
-                "transcript_path": "C:/transcript.jsonl",
-                "session_id": "anthropic-session-123",
-            })
-        self.assertIn("RECENT CHAT", prompt)
-        self.assertIn("GIT STATE", prompt)
-        self.assertIn("separate Ollama-backed Claude Code session", prompt)
+    def test_permission_mode_inherits_from_primary_request(self):
+        self.assertEqual(supervisor.resolved_permission_mode({"permission_mode": "plan"}), "plan")
+        with mock.patch.dict(os.environ, {"CLAUDE_OLLAMA_PERMISSION_MODE": "acceptEdits"}, clear=False):
+            self.assertEqual(supervisor.resolved_permission_mode({"permission_mode": "plan"}), "acceptEdits")
 
-    def test_simulated_recovery_does_not_force_immediate_return_signal(self):
+    def test_model_check_does_not_accept_wrong_tag(self):
+        with mock.patch.object(runtime, "installed_models", return_value=(True, ["qwen3.5:0.8b"], "")):
+            ok, _ = runtime.model_available("qwen3.5")
+            self.assertFalse(ok)
+        with mock.patch.object(runtime, "installed_models", return_value=(True, ["qwen3.5:latest"], "")):
+            ok, _ = runtime.model_available("qwen3.5")
+            self.assertTrue(ok)
+
+
+class ControlBehaviorTests(unittest.TestCase):
+    def _live(self, root: pathlib.Path, pid: str, cwd: str) -> pathlib.Path:
+        path = root / pid
+        path.mkdir(parents=True)
+        (path / "heartbeat.json").write_text(json.dumps({"pid": int(pid), "cwd": cwd, "epoch": time.time()}), encoding="utf-8")
+        (path / "supervisor.json").write_text(json.dumps({"pid": int(pid), "cwd": cwd}), encoding="utf-8")
+        return path
+
+    def test_stale_supervisor_is_ignored(self):
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
-            root = control.state_dir() / "supervisor" / "222"
-            root.mkdir(parents=True)
-            (root / "heartbeat.json").write_text(json.dumps({"epoch": time.time()}), encoding="utf-8")
-            self.assertEqual(control.simulate_recovery(), 0)
-            self.assertTrue((root / "primary-ready.json").exists())
-            self.assertFalse((root / "return-request.json").exists())
+            root = control.state_dir() / "supervisor"
+            stale = root / "111"
+            stale.mkdir(parents=True)
+            (stale / "heartbeat.json").write_text(json.dumps({"epoch": time.time() - 60}), encoding="utf-8")
+            live = self._live(root, "222", "C:/repo")
+            self.assertEqual(control.active_control(), live)
+
+    def test_multiple_live_sessions_refuse_to_guess(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
+            root = control.state_dir() / "supervisor"
+            self._live(root, "111", "C:/one")
+            self._live(root, "222", "C:/two")
+            with self.assertRaises(SystemExit):
+                control.active_control()
+            self.assertEqual(control.active_control(222).name, "222")
+
+    def test_simulated_recovery_waits_for_safe_stop(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
+            root = control.state_dir() / "supervisor"
+            live = self._live(root, "222", "C:/repo")
+            self.assertEqual(control.simulate_recovery(222), 0)
+            self.assertTrue((live / "primary-ready.json").exists())
+            self.assertFalse((live / "return-request.json").exists())
 
 
 class HookBehaviorTests(unittest.TestCase):
-    def test_rate_limit_creates_fallback_signal(self):
+    def test_rate_limit_creates_fallback_signal_with_permission_mode(self):
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {
             "CLAUDE_CONTINUITY_SUPERVISED": "1",
             "CLAUDE_CONTINUITY_PROVIDER": "anthropic",
@@ -107,6 +137,7 @@ class HookBehaviorTests(unittest.TestCase):
                 "hook_event_name": "StopFailure",
                 "session_id": "abc",
                 "cwd": tempdir,
+                "permission_mode": "plan",
                 "error": "rate_limit",
                 "error_details": "429",
             })
@@ -115,14 +146,25 @@ class HookBehaviorTests(unittest.TestCase):
             payload = json.loads(signal.read_text(encoding="utf-8"))
             self.assertEqual(payload["session_id"], "abc")
             self.assertEqual(payload["error"], "rate_limit")
+            self.assertEqual(payload["permission_mode"], "plan")
 
-    def test_non_official_overloaded_value_does_not_trigger(self):
+    def test_probe_events_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {
+            "CLAUDE_CONTINUITY_SUPERVISED": "1",
+            "CLAUDE_CONTINUITY_PROVIDER": "anthropic",
+            "CLAUDE_CONTINUITY_CONTROL_DIR": tempdir,
+            "CLAUDE_CONTINUITY_PROBE": "1",
+        }, clear=False):
+            supervisor_hook.handle({"hook_event_name": "Stop", "session_id": "probe"})
+            self.assertFalse((pathlib.Path(tempdir) / "current-session.json").exists())
+
+    def test_non_supported_error_does_not_trigger(self):
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {
             "CLAUDE_CONTINUITY_SUPERVISED": "1",
             "CLAUDE_CONTINUITY_PROVIDER": "anthropic",
             "CLAUDE_CONTINUITY_CONTROL_DIR": tempdir,
         }, clear=False):
-            supervisor_hook.handle({"hook_event_name": "StopFailure", "error": "overloaded"})
+            supervisor_hook.handle({"hook_event_name": "StopFailure", "error": "invalid_request"})
             self.assertFalse((pathlib.Path(tempdir) / "fallback-request.json").exists())
 
 
