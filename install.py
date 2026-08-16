@@ -2,13 +2,14 @@
 """Installer for Claude -> Ollama Continuity."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import pathlib
 import shutil
 import stat
+import subprocess
 import sys
-import datetime as dt
 
 APP = "claude-ollama-continuity"
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -63,50 +64,127 @@ def _ensure_hook(hooks: dict, event: str, target: pathlib.Path, matcher: str | N
     entries.append(entry)
 
 
+def existing_real_claude() -> str | None:
+    config = INSTALL_DIR / "config.json"
+    if config.exists():
+        try:
+            data = json.loads(config.read_text(encoding="utf-8"))
+            candidate = str(data.get("real_claude") or "")
+            if candidate and pathlib.Path(candidate).exists():
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
+def find_real_claude() -> str:
+    saved = existing_real_claude()
+    if saved:
+        return saved
+    path_parts = []
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            if pathlib.Path(part).resolve() == BIN_DIR.resolve():
+                continue
+        except OSError:
+            pass
+        path_parts.append(part)
+    candidate = shutil.which("claude", path=os.pathsep.join(path_parts))
+    if not candidate:
+        raise SystemExit("Claude Code must be installed before Claude Ollama Continuity.")
+    return str(pathlib.Path(candidate).resolve())
+
+
+def ensure_user_path_windows(directory: pathlib.Path) -> None:
+    if os.name != "nt":
+        return
+    current = os.environ.get("PATH", "")
+    pieces = current.split(os.pathsep)
+    target = str(directory)
+    if not any(piece.lower() == target.lower() for piece in pieces if piece):
+        os.environ["PATH"] = target + os.pathsep + current
+
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        user_path = proc.stdout.strip()
+        entries = [p for p in user_path.split(";") if p]
+        entries = [p for p in entries if p.lower() != target.lower()]
+        new_path = ";".join([target, *entries])
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "[Environment]::SetEnvironmentVariable('Path', $args[0], 'User')",
+                new_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        print(f"WARNING: Could not add {target} to User PATH automatically.")
+
+
 def main() -> int:
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 
+    real_claude = find_real_claude()
+    config = {"real_claude": real_claude, "repository": "marianelarojas30-alt/claude-ollama-fallback-windows"}
+    atomic_write_json(INSTALL_DIR / "config.json", config)
+
+    files = ["continuity.py", "supervisor.py", "supervisor_hook.py", "install.py"]
+    for name in files:
+        source = ROOT / name
+        if source.exists():
+            shutil.copy2(source, INSTALL_DIR / name)
+
     target = INSTALL_DIR / "continuity.py"
     supervisor = INSTALL_DIR / "supervisor.py"
     hook_target = INSTALL_DIR / "supervisor_hook.py"
-    shutil.copy2(ROOT / "continuity.py", target)
-    shutil.copy2(ROOT / "supervisor.py", supervisor)
-    shutil.copy2(ROOT / "supervisor_hook.py", hook_target)
+
     if os.name != "nt":
-        target.chmod(target.stat().st_mode | stat.S_IXUSR)
-        supervisor.chmod(supervisor.stat().st_mode | stat.S_IXUSR)
-        hook_target.chmod(hook_target.stat().st_mode | stat.S_IXUSR)
+        for path in (target, supervisor, hook_target):
+            path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     if os.name == "nt":
-        launcher = BIN_DIR / "claude-continuity.cmd"
-        launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{target}" %*\r\n',
-            encoding="utf-8",
+        continuity_launcher = BIN_DIR / "claude-continuity.cmd"
+        continuity_launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{target}" %*\r\n', encoding="utf-8"
         )
         smart_launcher = BIN_DIR / "smart-claude.cmd"
         smart_launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{supervisor}" --cwd "%CD%"\r\n',
+            f'@echo off\r\n"{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n', encoding="utf-8"
+        )
+        global_claude = BIN_DIR / "claude.cmd"
+        global_claude.write_text(
+            f'@echo off\r\nif "%CLAUDE_CONTINUITY_INTERNAL%"=="1" (\r\n  "{real_claude}" %*\r\n) else (\r\n  "{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n)\r\n',
             encoding="utf-8",
         )
+        ensure_user_path_windows(BIN_DIR)
     else:
-        launcher = BIN_DIR / "claude-continuity"
-        launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{target}" "$@"\n',
-            encoding="utf-8",
+        continuity_launcher = BIN_DIR / "claude-continuity"
+        continuity_launcher.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{target}" "$@"\n', encoding="utf-8"
         )
-        launcher.chmod(0o755)
+        continuity_launcher.chmod(0o755)
         smart_launcher = BIN_DIR / "smart-claude"
         smart_launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD"\n',
-            encoding="utf-8",
+            f'#!/bin/sh\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD" -- "$@"\n', encoding="utf-8"
         )
         smart_launcher.chmod(0o755)
+        global_claude = smart_launcher
 
     data = load_settings()
     hooks = data.setdefault("hooks", {})
-
     legacy_markers = (str(target), str(hook_target), APP)
     for event in ("StopFailure", "Stop", "UserPromptSubmit"):
         entries = hooks.get(event, [])
@@ -133,14 +211,13 @@ def main() -> int:
         print(f"Backup: {backup}")
 
     atomic_write_json(SETTINGS, data)
-    print("\nINSTALLED OK")
-    print(f"Worker:          {target}")
-    print(f"Supervisor:      {supervisor}")
-    print(f"Supervisor hook: {hook_target}")
-    print(f"Launcher:        {launcher}")
-    print(f"Smart launcher:  {smart_launcher}")
-    print(f"Settings:        {SETTINGS}")
-    print("\nFor same-terminal automatic failover and return, start work with smart-claude.cmd")
+    print("\nINSTALLED / UPDATED OK")
+    print(f"Real Claude:      {real_claude}")
+    print(f"Global wrapper:   {global_claude}")
+    print(f"Supervisor:       {supervisor}")
+    print(f"Settings:         {SETTINGS}")
+    print("\nOpen a NEW terminal. From then on use: claude")
+    print("Future upgrades: claude-continuity update")
     return 0
 
 
