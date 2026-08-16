@@ -1,97 +1,137 @@
-# Claude Ollama Fallback for Windows
+# Claude Ollama Continuity for Windows
 
-A Windows-first **same-terminal continuity supervisor** for Claude Code and Ollama.
-
-The goal is simple:
+A Windows-first continuity layer for **Claude Code -> Ollama -> Claude Code in the same terminal**.
 
 ```text
-Claude Code
-   ↓ usage/provider limit
-Ollama takes over in the SAME terminal
-   ↓ Claude becomes available again
-Return to Claude at a safe idle boundary
+claude
+  |
+  v
+Anthropic Claude Code
+  |
+  | StopFailure: rate/provider limit
+  v
+Ollama + qwen3.5, same terminal and same working directory
+  |
+  | Claude probe succeeds + Ollama reaches a safe Stop
+  v
+Original Anthropic session resumes
 ```
 
-The supervisor preserves the same working directory and reuses the Claude Code session ID with `--resume` so the conversation can continue instead of starting over.
+This project does **not** bypass Anthropic limits. While Anthropic is unavailable, work is performed by a local Ollama model. When a real Claude Code probe succeeds again, the supervisor returns to the original Anthropic session.
 
-> This does not bypass Anthropic limits. When Claude is unavailable, the work is performed by an Ollama model. When a real Claude request succeeds again, the supervisor switches back.
+## Final architecture
 
-## What triggers takeover
+Anthropic and Ollama deliberately use **separate Claude Code session IDs**. They share the same repository on disk, and the supervisor transfers recent transcript context plus git state in both directions.
 
-The `StopFailure` hook watches for:
-
-- `rate_limit`
-- `overloaded`
-- `billing_error`
-- `server_error`
-- `max_output_tokens`
-
-Authentication and invalid-request errors are intentionally excluded.
+This isolation is important. Reusing an Anthropic session with an Ollama model such as `qwen3.5` can leave model metadata in the session that normal Claude Code cannot restore later.
 
 ## Requirements
 
 Windows 10/11 with:
 
-- Claude Code available as `claude`
-- Ollama available as `ollama`
-- Python 3
-- Git recommended
+- Claude Code installed and authenticated
+- Ollama installed
+- Python 3 available as `py` or `python`
+- `qwen3.5` installed in Ollama, unless you set another model
+- Git recommended for better handoff summaries
 
-Default fallback model: `qwen3.5`.
+Ollama officially supports Claude Code through its Anthropic-compatible endpoint. Claude Code officially exposes `StopFailure`, including `rate_limit`, `billing_error`, `server_error`, and `max_output_tokens`, plus the session ID and transcript path used by this supervisor.
 
-## Install
+Official references:
 
-```text
-INSTALL_WINDOWS.bat
-PULL_MODEL_WINDOWS.bat
-CHECK_WINDOWS.bat
-```
+- Claude Code hooks: https://code.claude.com/docs/en/hooks
+- Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code/cli-usage
+- Ollama + Claude Code: https://docs.ollama.com/integrations/claude-code
 
-The installer merges its hooks into `%USERPROFILE%\.claude\settings.json` and backs up an existing settings file.
+## First install or repair
 
-## Start the smart session
-
-For automatic failover **and automatic return to Claude**, start your coding session with:
-
-```text
-START_SMART_CLAUDE_WINDOWS.bat
-```
-
-or PowerShell:
+From PowerShell:
 
 ```powershell
-& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\smart-claude.cmd"
+$u="$env:TEMP\claude-continuity-updater.py"; Invoke-WebRequest "https://raw.githubusercontent.com/marianelarojas30-alt/claude-ollama-fallback-windows/main/updater.py" -OutFile $u; py $u
 ```
 
-Starting ordinary `claude` does not give the supervisor control of that terminal. Use `smart-claude` when you want seamless switching.
+The updater resolves one exact Git commit first, downloads every runtime file from that same commit, installs it, imports the installed runtime as a verification step, then reports success.
 
-## How automatic return works
-
-While Ollama is active, the supervisor periodically sends a very small real request to Claude Code in an isolated probe directory.
-
-Default probe interval: **5 minutes**.
-
-If the probe succeeds, the supervisor does not immediately kill Ollama. It waits until the Ollama-backed Claude Code session emits `Stop`, which means the assistant has finished the current response. At that safe boundary it resumes the same session on Claude in the same terminal.
-
-Change the interval, for example to two minutes:
-
-```powershell
-setx CLAUDE_CONTINUITY_PROBE_SECONDS 120
-```
-
-Open a new terminal after `setx`.
-
-## Ollama connection
-
-The fallback Claude Code child process uses Ollama's Anthropic-compatible local endpoint only for that process:
+A successful install must show:
 
 ```text
-ANTHROPIC_AUTH_TOKEN=ollama
-ANTHROPIC_API_KEY=
-ANTHROPIC_BASE_URL=http://localhost:11434
+Runtime verification: OK
+INSTALLED / UPDATED OK
+UPDATE COMPLETE
 ```
 
-These values are not written globally by the supervisor, which lets it return cleanly to the normal Anthropic-backed Claude Code process.
+Close all terminals and open a new one after installation.
+
+## Prepare Ollama
+
+```powershell
+ollama --version
+ollama pull qwen3.5
+ollama list
+```
+
+The requested model must appear as `qwen3.5` or `qwen3.5:latest`.
+
+## Verify the whole installation
+
+```powershell
+claude-continuity doctor
+```
+
+Do not rely on automatic takeover until every doctor line is `OK` and the final line says `READY`.
+
+## Normal use
+
+Use Claude exactly as before, from any project directory:
+
+```powershell
+cd C:\path\to\your-project
+claude
+```
+
+There is no `smart-claude` command required. The global `claude.cmd` wrapper starts the supervisor, which starts the real Claude executable in the same console.
+
+## Automatic takeover
+
+The global Claude Code hook watches `StopFailure` for:
+
+- `rate_limit`
+- `billing_error`
+- `server_error`
+- `max_output_tokens`
+
+When one occurs, the supervisor captures the original Anthropic `session_id`, transcript path, working directory and permission mode. It then starts a **new** Ollama-backed Claude Code session in the same terminal and project, with the recent Anthropic transcript and repository state in its handoff prompt.
+
+Claude itself still starts normally even if Ollama is missing. Ollama readiness is checked only when a takeover is actually required.
+
+## Automatic return
+
+While Ollama is active, the supervisor sends a small isolated Claude Code probe every **120 seconds** by default.
+
+The probe is explicitly marked so its hooks cannot overwrite the real session state.
+
+When the probe succeeds, the supervisor waits for Ollama's next `Stop` event. Only at that safe idle boundary does it stop the Ollama child and resume the **original Anthropic session ID**, adding a handback containing the current git state and recent Ollama transcript.
+
+Change the interval if needed:
+
+```powershell
+setx CLAUDE_CONTINUITY_PROBE_SECONDS 60
+```
+
+Open a new terminal after changing it.
+
+## Permission behavior
+
+By default, the Ollama fallback inherits the permission mode reported by the interrupted Claude session. This avoids silently giving the local model more privileges than Claude had.
+
+You can explicitly override it for future terminals:
+
+```powershell
+setx CLAUDE_OLLAMA_PERMISSION_MODE acceptEdits
+```
+
+`bypassPermissions` is supported but is intentionally not the default because it allows autonomous shell/file actions without the normal approval boundary.
 
 ## Change the fallback model
 
@@ -99,62 +139,58 @@ These values are not written globally by the supervisor, which lets it return cl
 setx CLAUDE_OLLAMA_MODEL qwen3.5
 ```
 
-For large repositories, configure an Ollama context window of 64K or higher when the model and hardware allow it.
+Ollama recommends a context window of at least 64K for Claude Code workloads.
 
-## Permission modes
+## Upgrade
 
-Default fallback permission mode:
+After the first successful installation:
 
-```text
-acceptEdits
+```powershell
+claude-continuity update
 ```
 
-`FULL_AUTO_ON_WINDOWS.bat` changes the Ollama-backed Claude Code process to `bypassPermissions`. That is intentionally not the default because it removes important command approval protections.
-
-Return to the safer mode with:
-
-```text
-SAFER_MODE_WINDOWS.bat
-```
-
-## Hooks installed
-
-The supervisor uses three Claude Code lifecycle events:
-
-- `StopFailure` to detect a supported Claude API failure
-- `UserPromptSubmit` to know that the Ollama fallback is actively processing a new turn
-- `Stop` to identify a safe idle boundary for switching back to Claude
-
-The hook process only writes small local control signals. The parent supervisor performs the actual provider switching.
+Every update is pinned to one exact Git commit before any runtime file is downloaded, preventing mixed-version installs.
 
 ## Diagnostics
 
-```text
-CHECK_WINDOWS.bat
-RUN_TESTS_WINDOWS.bat
+```powershell
+claude-continuity doctor
+claude-continuity version
+claude-continuity sessions
 ```
 
-Inside Claude Code, `/hooks` can be used to verify the installed hook entries.
+If multiple supervised Claude sessions are open, test commands refuse to guess which one you mean.
 
-## Important limitation
+## Exact failover test
 
-A **subscription or provider limit** that Claude Code exposes as `StopFailure` can trigger takeover.
+Open Claude in the project you want to test. In a second PowerShell:
 
-A **context-window compaction event** is different. Claude Code has `PreCompact` and `PostCompact` lifecycle behavior and may compact the conversation instead of producing `StopFailure`. This project does not pretend those are the same condition.
-
-Also, automatic return is based on a successful Claude availability probe. A successful probe proves that a small Claude Code request works again, but it cannot guarantee that every later request will remain below all account or provider limits.
-
-## Uninstall
-
-```text
-UNINSTALL_WINDOWS.bat
+```powershell
+claude-continuity sessions
 ```
 
-This removes this project's installed hooks and files. It does not uninstall Claude Code, Ollama, Python, or Git.
+Copy the PID for the desired project, then:
 
-## Security
+```powershell
+claude-continuity simulate-limit --pid 12345
+```
 
-Read [SECURITY.md](SECURITY.md) before enabling full-auto mode.
+The Claude terminal should show `CLAUDE LIMIT DETECTED` followed by `OLLAMA ACTIVE`.
+
+When Ollama has reached an idle prompt, simulate recovery:
+
+```powershell
+claude-continuity simulate-recovery --pid 12345
+```
+
+The return waits for a safe Ollama Stop boundary, then the same terminal should show `CLAUDE ACTIVE` again.
+
+## Important boundaries
+
+- Context compaction is not a provider outage. Claude Code handles that separately.
+- A successful availability probe proves a small Claude request works again, not that future usage cannot hit another limit.
+- File state is shared because both providers operate in the same working directory. Conversation continuity is transferred explicitly; provider session IDs remain isolated.
+- The supervisor never changes global Anthropic endpoint variables. Ollama endpoint variables exist only in the Ollama child process.
 
 ## License
 
