@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Compile
-        run: python -m py_compile continuity.py supervisor.py supervisor_hook.py install.py uninstall.py
-      - name: Unit tests
+      - name: Compile all runtime files
+        run: python -m py_compile continuity.py runtime.py supervisor.py supervisor_hook.py control.py install.py updater.py uninstall.py
+      - name: Behavioral unit tests
         run: python -m unittest discover -s tests -v
