@@ -130,16 +130,42 @@ def ensure_user_path_windows(directory: pathlib.Path) -> None:
         print(f"WARNING: Could not add {target} to User PATH automatically.")
 
 
+def find_ollama_windows() -> pathlib.Path | None:
+    if os.name != "nt":
+        return None
+    existing = shutil.which("ollama")
+    if existing:
+        return pathlib.Path(existing)
+    candidates = [
+        LOCAL / "Programs" / "Ollama" / "ollama.exe",
+        LOCAL / "Ollama" / "ollama.exe",
+        pathlib.Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Ollama" / "ollama.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def main() -> int:
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 
     real_claude = find_real_claude()
+
+    ollama_exe = find_ollama_windows()
+    if os.name == "nt" and ollama_exe is not None:
+        ensure_user_path_windows(ollama_exe.parent)
+        print(f"Ollama found:      {ollama_exe}")
+    elif os.name == "nt":
+        print("WARNING: Ollama not found. Install Ollama before using automatic fallback.")
+
     atomic_write_json(
         INSTALL_DIR / "config.json",
         {
             "real_claude": real_claude,
+            "ollama_exe": str(ollama_exe) if ollama_exe else None,
             "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
         },
     )
