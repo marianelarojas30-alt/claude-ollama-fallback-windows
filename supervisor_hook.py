@@ -11,7 +11,6 @@ from typing import Any
 
 SUPPORTED_ERRORS = {
     "rate_limit",
-    "overloaded",
     "billing_error",
     "server_error",
     "max_output_tokens",
@@ -60,8 +59,6 @@ def handle(payload: dict[str, Any]) -> int:
     event = str(payload.get("hook_event_name") or "")
     provider = os.environ.get("CLAUDE_CONTINUITY_PROVIDER", "")
 
-    # Persist the active Claude session on every supervised lifecycle event so
-    # testing and provider handoffs can resume the exact same conversation.
     write_signal(
         "current-session.json",
         {
