@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ==============================================
-echo  Claude to Ollama Continuity - Windows Setup
+echo  Claude Ollama Continuity 1.0 - Windows Setup
 echo ==============================================
 echo.
 where py >nul 2>nul
@@ -13,7 +13,6 @@ if %errorlevel%==0 (
   where python >nul 2>nul
   if not %errorlevel%==0 (
     echo ERROR: Python 3 was not found in PATH.
-    echo Install Python 3, reopen this window, and run this file again.
     pause
     exit /b 2
   )
@@ -28,5 +27,8 @@ if not %INSTALL_RC%==0 (
 )
 echo.
 echo Installation complete.
-echo Next run PULL_MODEL_WINDOWS.bat and then CHECK_WINDOWS.bat.
+echo Close all terminals, open a new PowerShell, then run:
+echo   ollama pull qwen3.5
+echo   claude-continuity doctor
+echo Normal use after READY: claude
 pause
