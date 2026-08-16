@@ -9,7 +9,6 @@ import pathlib
 import sys
 from typing import Any
 
-# Provider-unavailability conditions that justify switching away from Anthropic.
 SUPPORTED_ERRORS = {
     "rate_limit",
     "billing_error",
@@ -79,15 +78,14 @@ def handle(payload: dict[str, Any]) -> int:
             remove_signal("fallback-idle.json")
             return 0
         if event == "Stop":
-            idle = {
-                "created_at": now_iso(),
-                "session_id": payload.get("session_id"),
-                "cwd": payload.get("cwd") or os.getcwd(),
-            }
-            write_signal("fallback-idle.json", idle)
-            root = control_dir()
-            if root is not None and (root / "primary-ready.json").exists():
-                write_signal("return-request.json", idle)
+            write_signal(
+                "fallback-idle.json",
+                {
+                    "created_at": now_iso(),
+                    "session_id": payload.get("session_id"),
+                    "cwd": payload.get("cwd") or os.getcwd(),
+                },
+            )
             return 0
 
     if provider == "anthropic" and event == "StopFailure":
