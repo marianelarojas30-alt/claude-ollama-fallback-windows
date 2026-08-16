@@ -20,6 +20,7 @@ REQUIRED_FILES = [
     "continuity.py",
     "supervisor.py",
     "supervisor_hook.py",
+    "control.py",
     "install.py",
 ]
 OPTIONAL_FILES = ["updater.py"]
@@ -54,9 +55,6 @@ def main() -> int:
                 print(f"  downloaded {name}")
                 continue
 
-            # The updater is already running locally. If GitHub raw is briefly
-            # inconsistent or unavailable for this one file, reuse this copy so
-            # the main upgrade can still complete.
             current = pathlib.Path(__file__).resolve()
             if current.exists():
                 shutil.copy2(current, root / name)
