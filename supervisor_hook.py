@@ -9,6 +9,7 @@ import pathlib
 import sys
 from typing import Any
 
+# Provider-unavailability conditions that justify switching away from Anthropic.
 SUPPORTED_ERRORS = {
     "rate_limit",
     "billing_error",
@@ -58,6 +59,7 @@ def handle(payload: dict[str, Any]) -> int:
 
     event = str(payload.get("hook_event_name") or "")
     provider = os.environ.get("CLAUDE_CONTINUITY_PROVIDER", "")
+    permission_mode = payload.get("permission_mode")
 
     write_signal(
         "current-session.json",
@@ -66,6 +68,7 @@ def handle(payload: dict[str, Any]) -> int:
             "session_id": payload.get("session_id"),
             "cwd": payload.get("cwd") or os.getcwd(),
             "transcript_path": payload.get("transcript_path"),
+            "permission_mode": permission_mode,
             "provider": provider,
             "event": event,
         },
@@ -97,6 +100,7 @@ def handle(payload: dict[str, Any]) -> int:
                 "created_at": now_iso(),
                 "session_id": payload.get("session_id"),
                 "cwd": payload.get("cwd") or os.getcwd(),
+                "permission_mode": permission_mode,
                 "error": error,
                 "error_details": payload.get("error_details"),
                 "transcript_path": payload.get("transcript_path"),
