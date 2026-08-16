@@ -153,13 +153,12 @@ def main() -> int:
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 
     real_claude = find_real_claude()
-
     ollama_exe = find_ollama_windows()
     if os.name == "nt" and ollama_exe is not None:
         ensure_user_path_windows(ollama_exe.parent)
         print(f"Ollama found:      {ollama_exe}")
     elif os.name == "nt":
-        print("WARNING: Ollama not found. Install Ollama before using automatic fallback.")
+        print("WARNING: Ollama not found. Claude will still start; fallback will report not ready if needed.")
 
     atomic_write_json(
         INSTALL_DIR / "config.json",
@@ -172,6 +171,7 @@ def main() -> int:
 
     files = [
         "continuity.py",
+        "runtime.py",
         "supervisor.py",
         "supervisor_hook.py",
         "control.py",
@@ -184,13 +184,14 @@ def main() -> int:
             shutil.copy2(source, INSTALL_DIR / name)
 
     target = INSTALL_DIR / "continuity.py"
+    runtime_target = INSTALL_DIR / "runtime.py"
     supervisor = INSTALL_DIR / "supervisor.py"
     hook_target = INSTALL_DIR / "supervisor_hook.py"
     control = INSTALL_DIR / "control.py"
     updater = INSTALL_DIR / "updater.py"
 
     if os.name != "nt":
-        for path in (target, supervisor, hook_target, control, updater):
+        for path in (target, runtime_target, supervisor, hook_target, control, updater):
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     if os.name == "nt":
@@ -251,7 +252,7 @@ def main() -> int:
         hooks,
         "StopFailure",
         hook_target,
-        "rate_limit|overloaded|billing_error|server_error|max_output_tokens",
+        "rate_limit|billing_error|server_error|max_output_tokens",
     )
     _ensure_hook(hooks, "Stop", hook_target)
     _ensure_hook(hooks, "UserPromptSubmit", hook_target)
