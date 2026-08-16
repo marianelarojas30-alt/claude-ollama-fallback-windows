@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 APP = "claude-ollama-continuity"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DEFAULT_MODEL = os.environ.get("CLAUDE_OLLAMA_MODEL", "qwen3.5")
 
 
