@@ -1,146 +1,156 @@
 # Claude Ollama Fallback for Windows
 
-A Windows-first continuity bridge for **Claude Code → Ollama**.
+A Windows-first **same-terminal continuity supervisor** for Claude Code and Ollama.
 
-When a Claude Code turn ends with a supported API failure, this project captures the current repository state and recent Claude transcript, then starts a new Claude Code worker backed by Ollama in the **same working directory** so it can continue the unfinished coding task.
+The goal is simple:
 
-> This is a continuity helper, not a way to bypass Anthropic billing or usage rules. The fallback work is executed by an Ollama model on your machine (or whatever Ollama model you configure).
+```text
+Claude Code
+   ↓ usage/provider limit
+Ollama takes over in the SAME terminal
+   ↓ Claude becomes available again
+Return to Claude at a safe idle boundary
+```
 
-## What it catches
+The supervisor preserves the same working directory and reuses the Claude Code session ID with `--resume` so the conversation can continue instead of starting over.
 
-The installed Claude Code `StopFailure` hook listens for:
+> This does not bypass Anthropic limits. When Claude is unavailable, the work is performed by an Ollama model. When a real Claude request succeeds again, the supervisor switches back.
+
+## What triggers takeover
+
+The `StopFailure` hook watches for:
 
 - `rate_limit`
+- `overloaded`
 - `billing_error`
 - `server_error`
 - `max_output_tokens`
 
-Authentication failures are intentionally excluded by default.
+Authentication and invalid-request errors are intentionally excluded.
 
 ## Requirements
 
 Windows 10/11 with:
 
-- Claude Code installed and available as `claude`
-- Ollama installed and available as `ollama`
+- Claude Code available as `claude`
+- Ollama available as `ollama`
 - Python 3
 - Git recommended
 
-Default Ollama model: `qwen3.5`.
+Default fallback model: `qwen3.5`.
 
 ## Install
 
-Clone this repository or download it from GitHub, then:
+```text
+INSTALL_WINDOWS.bat
+PULL_MODEL_WINDOWS.bat
+CHECK_WINDOWS.bat
+```
 
-1. Run `INSTALL_WINDOWS.bat`
-2. Run `PULL_MODEL_WINDOWS.bat`
-3. Run `CHECK_WINDOWS.bat`
-4. Optionally run `TEST_TAKEOVER_WINDOWS.bat`
+The installer merges its hooks into `%USERPROFILE%\.claude\settings.json` and backs up an existing settings file.
 
-The installer **merges** the new hook into `%USERPROFILE%\.claude\settings.json` instead of replacing all existing hooks, and creates a backup when that file already exists.
+## Start the smart session
 
-## How the handoff works
+For automatic failover **and automatic return to Claude**, start your coding session with:
 
 ```text
-Claude Code
-   │
-   │ StopFailure: rate limit / billing / server / max output
-   ▼
-continuity.py hook
-   │
-   ├─ records cwd + recent transcript
-   ├─ records git status / diff summary / recent commits
-   ├─ writes a handoff bundle
-   └─ starts detached continuity worker
-          │
-          ▼
-     ollama launch claude
-          │
-          ▼
-     Claude Code using Ollama
-          │
-          └─ continues in the same repository
+START_SMART_CLAUDE_WINDOWS.bat
 ```
 
-A recursion guard prevents the Ollama-backed worker from triggering another fallback loop through the same hook.
-
-## Commands
-
-After installation, PowerShell:
+or PowerShell:
 
 ```powershell
-& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\claude-continuity.cmd" doctor
-& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\claude-continuity.cmd" status
-& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\claude-continuity.cmd" logs
-& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\claude-continuity.cmd" manual "continue the unfinished task and verify the result"
+& "$env:LOCALAPPDATA\claude-ollama-continuity\bin\smart-claude.cmd"
 ```
 
-## Change the model
+Starting ordinary `claude` does not give the supervisor control of that terminal. Use `smart-claude` when you want seamless switching.
+
+## How automatic return works
+
+While Ollama is active, the supervisor periodically sends a very small real request to Claude Code in an isolated probe directory.
+
+Default probe interval: **5 minutes**.
+
+If the probe succeeds, the supervisor does not immediately kill Ollama. It waits until the Ollama-backed Claude Code session emits `Stop`, which means the assistant has finished the current response. At that safe boundary it resumes the same session on Claude in the same terminal.
+
+Change the interval, for example to two minutes:
+
+```powershell
+setx CLAUDE_CONTINUITY_PROBE_SECONDS 120
+```
+
+Open a new terminal after `setx`.
+
+## Ollama connection
+
+The fallback Claude Code child process uses Ollama's Anthropic-compatible local endpoint only for that process:
+
+```text
+ANTHROPIC_AUTH_TOKEN=ollama
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=http://localhost:11434
+```
+
+These values are not written globally by the supervisor, which lets it return cleanly to the normal Anthropic-backed Claude Code process.
+
+## Change the fallback model
 
 ```powershell
 setx CLAUDE_OLLAMA_MODEL qwen3.5
 ```
 
-Open a new terminal after `setx`.
+For large repositories, configure an Ollama context window of 64K or higher when the model and hardware allow it.
 
 ## Permission modes
 
-Default:
+Default fallback permission mode:
 
 ```text
 acceptEdits
 ```
 
-This is deliberate. The fallback can edit repository files but still retains more safeguards than full bypass mode.
+`FULL_AUTO_ON_WINDOWS.bat` changes the Ollama-backed Claude Code process to `bypassPermissions`. That is intentionally not the default because it removes important command approval protections.
 
-`FULL_AUTO_ON_WINDOWS.bat` changes the fallback to Claude Code `bypassPermissions`. Use it only in a trusted and preferably isolated development environment.
-
-Return to the safer default with:
+Return to the safer mode with:
 
 ```text
 SAFER_MODE_WINDOWS.bat
 ```
 
-## Logs and handoff data
+## Hooks installed
 
-On Windows the runtime state is stored under:
+The supervisor uses three Claude Code lifecycle events:
 
-```text
-%LOCALAPPDATA%\claude-ollama-continuity\state
-```
+- `StopFailure` to detect a supported Claude API failure
+- `UserPromptSubmit` to know that the Ollama fallback is actively processing a new turn
+- `Stop` to identify a safe idle boundary for switching back to Claude
 
-Each takeover gets its own run directory containing:
+The hook process only writes small local control signals. The parent supervisor performs the actual provider switching.
 
-- `handoff.json`
-- `handoff.md`
-- `worker.log`
-- `result.json`
-
-`handoff.json` and `handoff.md` can contain excerpts from the local Claude Code transcript. Treat the state directory as sensitive and do not publish it.
-
-## Tests
-
-Run:
+## Diagnostics
 
 ```text
+CHECK_WINDOWS.bat
 RUN_TESTS_WINDOWS.bat
 ```
 
-GitHub Actions also compiles and tests the Python code on `windows-latest`.
+Inside Claude Code, `/hooks` can be used to verify the installed hook entries.
 
 ## Important limitation
 
-Claude Code has its own context management and compaction behavior. A full context window does **not necessarily** produce `StopFailure`. This repository automatically takes over when Claude Code emits one of the configured API failure events. It cannot guarantee that every subscription usage-limit situation will be surfaced by Claude Code as one of those events.
+A **subscription or provider limit** that Claude Code exposes as `StopFailure` can trigger takeover.
+
+A **context-window compaction event** is different. Claude Code has `PreCompact` and `PostCompact` lifecycle behavior and may compact the conversation instead of producing `StopFailure`. This project does not pretend those are the same condition.
+
+Also, automatic return is based on a successful Claude availability probe. A successful probe proves that a small Claude Code request works again, but it cannot guarantee that every later request will remain below all account or provider limits.
 
 ## Uninstall
-
-Run:
 
 ```text
 UNINSTALL_WINDOWS.bat
 ```
 
-That removes this project's `StopFailure` hook and installed worker. It does not uninstall Claude Code, Ollama, Python, or Git.
+This removes this project's installed hooks and files. It does not uninstall Claude Code, Ollama, Python, or Git.
 
 ## Security
 
