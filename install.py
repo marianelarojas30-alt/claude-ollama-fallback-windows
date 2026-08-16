@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 APP = "claude-ollama-continuity"
-PACKAGE_VERSION = "1.0.0"
+PACKAGE_VERSION = "1.0.1"
 ROOT = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path.home()
 CLAUDE_DIR = HOME / ".claude"
@@ -105,28 +105,52 @@ def find_ollama_windows() -> pathlib.Path | None:
     return None
 
 
+def _same_windows_path(left: str, right: str) -> bool:
+    return os.path.normcase(left.strip().rstrip("\\/")) == os.path.normcase(right.strip().rstrip("\\/"))
+
+
 def ensure_user_path_windows(directory: pathlib.Path) -> None:
+    """Put *directory* first in the current process and persistent User PATH.
+
+    This writes HKCU\\Environment\\Path directly with Python's winreg module.
+    It deliberately does not shell out to PowerShell, avoiding command-line
+    quoting/parsing failures for Windows paths.
+    """
     if os.name != "nt":
         return
+
     target = str(directory)
+
     current = os.environ.get("PATH", "")
-    if not any(p and os.path.normcase(p.rstrip("\\/")) == os.path.normcase(target.rstrip("\\/")) for p in current.split(";")):
-        os.environ["PATH"] = target + ";" + current
-    script = (
-        "$target=$args[0];"
-        "$p=[Environment]::GetEnvironmentVariable('Path','User');"
-        "$parts=@($p -split ';' | Where-Object {$_ -and $_.TrimEnd('\\') -ine $target.TrimEnd('\\')});"
-        "[Environment]::SetEnvironmentVariable('Path',($target+';'+($parts -join ';')),'User')"
-    )
-    proc = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", script, target],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise SystemExit("Could not update User PATH: " + proc.stderr.strip())
+    current_entries = [entry for entry in current.split(";") if entry]
+    if not any(_same_windows_path(entry, target) for entry in current_entries):
+        os.environ["PATH"] = target + (";" + current if current else "")
+
+    try:
+        import winreg
+
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            r"Environment",
+            0,
+            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+        ) as key:
+            try:
+                user_path, value_type = winreg.QueryValueEx(key, "Path")
+                user_path = str(user_path or "")
+            except FileNotFoundError:
+                user_path = ""
+                value_type = winreg.REG_EXPAND_SZ
+
+            entries = [entry for entry in user_path.split(";") if entry]
+            entries = [entry for entry in entries if not _same_windows_path(entry, target)]
+            new_path = ";".join([target, *entries])
+
+            if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                value_type = winreg.REG_EXPAND_SZ
+            winreg.SetValueEx(key, "Path", 0, value_type, new_path)
+    except OSError as exc:
+        raise SystemExit(f"Could not update User PATH in HKCU\\Environment: {exc}") from exc
 
 
 def remove_our_hooks(hooks: dict, marker: str) -> None:
@@ -265,7 +289,7 @@ def main() -> int:
     print(f"Real Claude:      {real_claude}")
     print(f"Ollama:           {ollama_exe or '(not found yet)'}")
     print(f"Global wrapper:   {BIN_DIR / ('claude.cmd' if os.name == 'nt' else 'claude')}")
-    print("\nOpen a NEW terminal, then run: claude-continuity doctor")
+    print("\nOpen a NEW terminal, then run: claude-continuity self-test")
     print("Normal use after that: claude")
     return 0
 
