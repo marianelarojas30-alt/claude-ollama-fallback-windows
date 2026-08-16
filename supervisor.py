@@ -15,8 +15,7 @@ from typing import Any
 import continuity
 import runtime
 
-POLL_SECONDS = max(30, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_SECONDS", "120")))
-PROBE_TIMEOUT = max(15, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_TIMEOUT", "45")))
+RETRY_SECONDS = max(30, int(os.environ.get("CLAUDE_CONTINUITY_RETRY_SECONDS", "300")))
 HANDOFF_CHARS = max(4000, int(os.environ.get("CLAUDE_CONTINUITY_HANDOFF_CHARS", "30000")))
 HANDBACK_CHARS = max(4000, int(os.environ.get("CLAUDE_CONTINUITY_HANDBACK_CHARS", "30000")))
 PASSTHROUGH_FLAGS = {"--help", "-h", "--version", "-v"}
@@ -43,8 +42,7 @@ def clean_control(control: pathlib.Path) -> None:
     for name in (
         "fallback-request.json",
         "fallback-idle.json",
-        "primary-ready.json",
-        "return-request.json",
+        "force-return.json",
         "current-session.json",
         "heartbeat.json",
         "supervisor.json",
@@ -112,12 +110,7 @@ def heartbeat_loop(control: pathlib.Path, cwd: str, stop_event: threading.Event)
         try:
             write_json_atomic(
                 control / "heartbeat.json",
-                {
-                    "pid": os.getpid(),
-                    "cwd": cwd,
-                    "updated_at": runtime.now_iso(),
-                    "epoch": time.time(),
-                },
+                {"pid": os.getpid(), "cwd": cwd, "updated_at": runtime.now_iso(), "epoch": time.time()},
             )
         except OSError:
             pass
@@ -132,43 +125,6 @@ def fallback_readiness(model: str) -> tuple[bool, str]:
     if not ok:
         return False, detail + f". Run: ollama pull {model}"
     return True, detail
-
-
-def probe_primary(control: pathlib.Path, stop_event: threading.Event) -> None:
-    probe_root = runtime.state_dir() / "probe"
-    probe_root.mkdir(parents=True, exist_ok=True)
-    while not stop_event.wait(POLL_SECONDS):
-        env = child_env(control, "anthropic")
-        env["CLAUDE_CONTINUITY_PROBE"] = "1"
-        cmd = [
-            real_claude(),
-            "-p",
-            "Reply exactly READY and do not use tools.",
-            "--max-turns",
-            "1",
-            "--output-format",
-            "json",
-        ]
-        try:
-            proc = subprocess.run(
-                runtime.normalize_exec(cmd),
-                cwd=str(probe_root),
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=PROBE_TIMEOUT,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0:
-            write_json_atomic(
-                control / "primary-ready.json",
-                {"created_at": runtime.now_iso(), "probe": "Claude request succeeded"},
-            )
-            return
 
 
 def build_primary_command(
@@ -205,9 +161,12 @@ def run_primary(
     handback_prompt: str | None = None,
 ) -> tuple[str, dict[str, Any] | None, str | None, int]:
     remove(control / "fallback-request.json")
-    cmd = build_primary_command(primary_session_id, initial_args, handback_prompt)
     banner("CLAUDE ACTIVE")
-    proc = spawn_visible(cmd, cwd, child_env(control, "anthropic"))
+    proc = spawn_visible(
+        build_primary_command(primary_session_id, initial_args, handback_prompt),
+        cwd,
+        child_env(control, "anthropic"),
+    )
     request_path = control / "fallback-request.json"
 
     while proc.poll() is None:
@@ -219,8 +178,7 @@ def run_primary(
             return "fallback", request, captured, 0
         time.sleep(0.15)
 
-    # StopFailure can be written at the same moment Claude exits. Check once more
-    # after process termination so a fast exit cannot race past the handoff.
+    # StopFailure may be written at the same moment the CLI exits.
     signaled = fallback_from_signal(request_path, primary_session_id)
     if signaled is not None:
         request, captured = signaled
@@ -234,7 +192,7 @@ def fallback_prompt(cwd: str, request: dict[str, Any] | None) -> str:
     request = request or {}
     transcript = continuity.extract_transcript(request.get("transcript_path"), limit=HANDOFF_CHARS)
     snapshot = continuity.git_snapshot(cwd)
-    details = request.get("error_details") or "Claude provider limit"
+    details = request.get("error_details") or request.get("last_assistant_message") or "Claude provider limit"
     return f"""You are the temporary Ollama fallback for an interrupted Claude Code session.
 
 The Anthropic session stopped because of: {request.get('error', 'unknown')}.
@@ -259,8 +217,7 @@ def resolved_permission_mode(request: dict[str, Any] | None) -> str:
     explicit = os.environ.get("CLAUDE_OLLAMA_PERMISSION_MODE")
     if explicit:
         return explicit
-    request = request or {}
-    return str(request.get("permission_mode") or "default")
+    return str((request or {}).get("permission_mode") or "default")
 
 
 def build_ollama_command(model: str, permission_mode: str, prompt: str) -> list[str]:
@@ -290,6 +247,13 @@ RECENT OLLAMA FALLBACK TRANSCRIPT
 """
 
 
+def ollama_is_safely_idle(control: pathlib.Path) -> bool:
+    if not (control / "fallback-idle.json").exists():
+        return False
+    current = read_json(control / "current-session.json") or {}
+    return current.get("provider") == "ollama" and current.get("event") == "Stop"
+
+
 def run_ollama(
     cwd: str,
     control: pathlib.Path,
@@ -300,43 +264,36 @@ def run_ollama(
     if not ok:
         banner("FALLBACK NOT READY")
         print(detail, flush=True)
-        print("Claude reached a provider limit, but Ollama is not ready. Run `claude-continuity doctor`.", flush=True)
+        print("Run `claude-continuity doctor` and `claude-continuity self-test`.", flush=True)
         return "exit", None, 78
 
     permission_mode = resolved_permission_mode(request)
-    for name in ("return-request.json", "fallback-idle.json", "primary-ready.json", "current-session.json"):
+    for name in ("fallback-idle.json", "force-return.json", "current-session.json"):
         remove(control / name)
 
-    cmd = build_ollama_command(model, permission_mode, fallback_prompt(cwd, request))
-    banner(f"OLLAMA ACTIVE ({model}). CLAUDE CHECK EVERY {POLL_SECONDS}s")
-    proc = spawn_visible(cmd, cwd, child_env(control, "ollama"))
+    retry_at = time.time() + RETRY_SECONDS
+    banner(f"OLLAMA ACTIVE ({model}). CLAUDE RETRY IN {RETRY_SECONDS}s")
+    proc = spawn_visible(
+        build_ollama_command(model, permission_mode, fallback_prompt(cwd, request)),
+        cwd,
+        child_env(control, "ollama"),
+    )
 
-    stop_probe = threading.Event()
-    probe = threading.Thread(target=probe_primary, args=(control, stop_probe), daemon=True)
-    probe.start()
-    idle_path = control / "fallback-idle.json"
-    ready_path = control / "primary-ready.json"
-    return_path = control / "return-request.json"
-    try:
-        while proc.poll() is None:
-            if return_path.exists() or (ready_path.exists() and idle_path.exists()):
-                handback = build_handback_prompt(cwd, control)
-                banner("CLAUDE AVAILABLE AGAIN. RETURNING AT SAFE CHECKPOINT")
-                stop_child(proc)
-                return "primary", handback, 0
-            time.sleep(0.15)
-    finally:
-        stop_probe.set()
+    while proc.poll() is None:
+        forced = (control / "force-return.json").exists()
+        due = time.time() >= retry_at
+        if (forced or due) and ollama_is_safely_idle(control):
+            handback = build_handback_prompt(cwd, control)
+            banner("RETRYING CLAUDE AT SAFE CHECKPOINT")
+            stop_child(proc)
+            return "primary", handback, 0
+        time.sleep(0.15)
 
-    if ready_path.exists():
-        return "primary", build_handback_prompt(cwd, control), 0
     return "exit", None, int(proc.returncode or 0)
 
 
 def should_passthrough(args: list[str]) -> bool:
-    if any(arg in PASSTHROUGH_FLAGS for arg in args):
-        return True
-    return bool(args and args[0] in PASSTHROUGH_COMMANDS)
+    return any(arg in PASSTHROUGH_FLAGS for arg in args) or bool(args and args[0] in PASSTHROUGH_COMMANDS)
 
 
 def supervise(cwd: str, claude_args: list[str]) -> int:
@@ -358,11 +315,7 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
     clean_control(control)
     write_json_atomic(
         control / "supervisor.json",
-        {
-            "pid": os.getpid(),
-            "cwd": str(cwd_path),
-            "started_at": runtime.now_iso(),
-        },
+        {"pid": os.getpid(), "cwd": str(cwd_path), "started_at": runtime.now_iso()},
     )
 
     primary_session_id: str | None = None
@@ -372,21 +325,17 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
     pending_handback: str | None = None
 
     heartbeat_stop = threading.Event()
-    heartbeat = threading.Thread(
+    threading.Thread(
         target=heartbeat_loop,
         args=(control, str(cwd_path), heartbeat_stop),
         daemon=True,
-    )
-    heartbeat.start()
+    ).start()
+
     try:
         while True:
             if provider == "primary":
                 action, request, primary_session_id, code = run_primary(
-                    str(cwd_path),
-                    control,
-                    primary_session_id,
-                    first_args,
-                    pending_handback,
+                    str(cwd_path), control, primary_session_id, first_args, pending_handback
                 )
                 first_args = []
                 pending_handback = None
@@ -400,7 +349,7 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
                 provider = "primary"
                 request = None
                 pending_handback = handback
-                for name in ("primary-ready.json", "return-request.json", "fallback-idle.json", "current-session.json"):
+                for name in ("fallback-idle.json", "force-return.json", "current-session.json"):
                     remove(control / name)
                 continue
             return code
