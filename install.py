@@ -103,7 +103,6 @@ def ensure_user_path_windows(directory: pathlib.Path) -> None:
     target = str(directory)
     if not any(piece.lower() == target.lower() for piece in pieces if piece):
         os.environ["PATH"] = target + os.pathsep + current
-
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"],
@@ -138,10 +137,13 @@ def main() -> int:
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 
     real_claude = find_real_claude()
-    config = {"real_claude": real_claude, "repository": "marianelarojas30-alt/claude-ollama-fallback-windows"}
+    config = {
+        "real_claude": real_claude,
+        "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
+    }
     atomic_write_json(INSTALL_DIR / "config.json", config)
 
-    files = ["continuity.py", "supervisor.py", "supervisor_hook.py", "install.py"]
+    files = ["continuity.py", "supervisor.py", "supervisor_hook.py", "install.py", "updater.py"]
     for name in files:
         source = ROOT / name
         if source.exists():
@@ -150,15 +152,17 @@ def main() -> int:
     target = INSTALL_DIR / "continuity.py"
     supervisor = INSTALL_DIR / "supervisor.py"
     hook_target = INSTALL_DIR / "supervisor_hook.py"
+    updater = INSTALL_DIR / "updater.py"
 
     if os.name != "nt":
-        for path in (target, supervisor, hook_target):
+        for path in (target, supervisor, hook_target, updater):
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     if os.name == "nt":
         continuity_launcher = BIN_DIR / "claude-continuity.cmd"
         continuity_launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{target}" %*\r\n', encoding="utf-8"
+            f'@echo off\r\nif /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n) else (\r\n  "{sys.executable}" "{target}" %*\r\n)\r\n',
+            encoding="utf-8",
         )
         smart_launcher = BIN_DIR / "smart-claude.cmd"
         smart_launcher.write_text(
@@ -173,7 +177,8 @@ def main() -> int:
     else:
         continuity_launcher = BIN_DIR / "claude-continuity"
         continuity_launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{target}" "$@"\n', encoding="utf-8"
+            f'#!/bin/sh\nif [ "$1" = "update" ]; then exec "{sys.executable}" "{updater}"; fi\nexec "{sys.executable}" "{target}" "$@"\n',
+            encoding="utf-8",
         )
         continuity_launcher.chmod(0o755)
         smart_launcher = BIN_DIR / "smart-claude"
