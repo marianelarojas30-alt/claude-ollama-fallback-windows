@@ -6,15 +6,13 @@ import argparse
 import json
 import os
 import pathlib
-import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from typing import Any
 
-import continuity
+import runtime
 
 POLL_SECONDS = max(30, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_SECONDS", "300")))
 PROBE_TIMEOUT = max(15, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_TIMEOUT", "60")))
@@ -27,11 +25,7 @@ def banner(text: str) -> None:
 
 
 def read_json(path: pathlib.Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
+    return runtime.read_json(path)
 
 
 def remove(path: pathlib.Path) -> None:
@@ -47,51 +41,21 @@ def clean_control(control: pathlib.Path) -> None:
         "fallback-idle.json",
         "primary-ready.json",
         "return-request.json",
+        "current-session.json",
+        "heartbeat.json",
     ):
         remove(control / name)
 
 
 def real_claude() -> str:
-    configured = os.environ.get("CLAUDE_REAL_EXE")
-    if configured and pathlib.Path(configured).exists():
-        return configured
-    config = pathlib.Path(__file__).resolve().parent / "config.json"
-    data = read_json(config)
-    if data:
-        candidate = str(data.get("real_claude") or "")
-        if candidate and pathlib.Path(candidate).exists():
-            return candidate
-    raise SystemExit(
-        "Real Claude Code executable not found. Run claude-continuity update or INSTALL_WINDOWS.bat."
-    )
+    candidate = runtime.real_claude_executable()
+    if candidate:
+        return candidate
+    raise SystemExit("Real Claude Code executable not found. Run claude-continuity update.")
 
 
 def child_env(control: pathlib.Path, provider: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["CLAUDE_REAL_EXE"] = real_claude()
-    env["CLAUDE_CONTINUITY_INTERNAL"] = "1"
-    env["CLAUDE_CONTINUITY_SUPERVISED"] = "1"
-    env["CLAUDE_CONTINUITY_PROVIDER"] = provider
-    env["CLAUDE_CONTINUITY_CONTROL_DIR"] = str(control)
-    if provider == "ollama":
-        env["CLAUDE_OLLAMA_FALLBACK_ACTIVE"] = "1"
-        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
-        env["ANTHROPIC_API_KEY"] = ""
-        env["ANTHROPIC_BASE_URL"] = os.environ.get(
-            "CLAUDE_OLLAMA_BASE_URL", "http://localhost:11434"
-        )
-    else:
-        env.pop("CLAUDE_OLLAMA_FALLBACK_ACTIVE", None)
-        if env.get("ANTHROPIC_AUTH_TOKEN") == "ollama":
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        if env.get("ANTHROPIC_API_KEY") == "":
-            env.pop("ANTHROPIC_API_KEY", None)
-        if env.get("ANTHROPIC_BASE_URL", "").rstrip("/") in {
-            "http://localhost:11434",
-            "http://127.0.0.1:11434",
-        }:
-            env.pop("ANTHROPIC_BASE_URL", None)
-    return env
+    return runtime.fallback_environment(control) if provider == "ollama" else runtime.primary_environment(control)
 
 
 def spawn_visible(cmd: list[str], cwd: str, env: dict[str, str]) -> subprocess.Popen[Any]:
@@ -100,7 +64,7 @@ def spawn_visible(cmd: list[str], cwd: str, env: dict[str, str]) -> subprocess.P
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(continuity.normalize_exec(cmd), **kwargs)
+    return subprocess.Popen(runtime.normalize_exec(cmd), **kwargs)
 
 
 def stop_child(proc: subprocess.Popen[Any], grace: float = 5.0) -> None:
@@ -132,12 +96,38 @@ def stop_child(proc: subprocess.Popen[Any], grace: float = 5.0) -> None:
         pass
 
 
+def write_json_atomic(path: pathlib.Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def heartbeat_loop(control: pathlib.Path, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            write_json_atomic(
+                control / "heartbeat.json",
+                {"pid": os.getpid(), "updated_at": runtime.now_iso(), "epoch": time.time()},
+            )
+        except OSError:
+            pass
+        stop_event.wait(1.0)
+
+
+def fallback_readiness(model: str) -> tuple[bool, str]:
+    ok, detail = runtime.ollama_available()
+    if not ok:
+        return False, detail
+    ok, detail = runtime.model_available(model)
+    if not ok:
+        return False, detail + f". Run: ollama pull {model}"
+    return True, detail
+
+
 def probe_primary(control: pathlib.Path, stop_event: threading.Event) -> None:
-    probe_root = continuity.state_dir() / "probe"
+    probe_root = runtime.state_dir() / "probe"
     probe_root.mkdir(parents=True, exist_ok=True)
     while not stop_event.wait(POLL_SECONDS):
-        env = child_env(control, "anthropic")
-        env["CLAUDE_CONTINUITY_PROBE"] = "1"
         cmd = [
             real_claude(),
             "-p",
@@ -149,9 +139,9 @@ def probe_primary(control: pathlib.Path, stop_event: threading.Event) -> None:
         ]
         try:
             proc = subprocess.run(
-                continuity.normalize_exec(cmd),
+                runtime.normalize_exec(cmd),
                 cwd=str(probe_root),
-                env=env,
+                env=child_env(control, "anthropic"),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -162,10 +152,10 @@ def probe_primary(control: pathlib.Path, stop_event: threading.Event) -> None:
         except (OSError, subprocess.SubprocessError):
             continue
         if proc.returncode == 0:
-            payload = {"created_at": continuity.now_iso(), "probe": "Claude request succeeded"}
-            tmp = control / "primary-ready.json.tmp"
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(tmp, control / "primary-ready.json")
+            write_json_atomic(
+                control / "primary-ready.json",
+                {"created_at": runtime.now_iso(), "probe": "Claude request succeeded"},
+            )
             return
 
 
@@ -188,21 +178,20 @@ def run_primary(
         if request_path.exists():
             request = read_json(request_path) or {}
             new_session = str(request.get("session_id") or session_id or "") or None
-            banner(f"CLAUDE LIMIT DETECTED ({request.get('error', 'unknown')}). SWITCHING TO OLLAMA")
-            time.sleep(0.5)
+            banner(f"CLAUDE LIMIT DETECTED ({request.get('error', 'unknown')})")
             stop_child(proc)
             return "fallback", request, new_session, 0
-        time.sleep(0.25)
+        time.sleep(0.2)
     return "exit", None, session_id, int(proc.returncode or 0)
 
 
 def fallback_prompt(request: dict[str, Any] | None) -> str:
     request = request or {}
-    details = request.get("error_details") or "Claude usage/provider limit"
+    details = request.get("error_details") or "Claude provider limit"
     return (
         "Continue the exact unfinished coding task from this session. "
-        "Claude became unavailable, so you are the local Ollama fallback. "
-        "Inspect the current repository and existing conversation before acting. "
+        "Claude became unavailable, so you are the Ollama fallback. "
+        "Inspect the current repository and conversation before acting. "
         "Do not restart completed work. Preserve unrelated user changes. "
         f"Previous provider failure: {details}."
     )
@@ -214,11 +203,17 @@ def run_ollama(
     session_id: str | None,
     request: dict[str, Any] | None,
 ) -> tuple[str, str | None, int]:
-    model = os.environ.get("CLAUDE_OLLAMA_MODEL", continuity.DEFAULT_MODEL)
+    model = os.environ.get("CLAUDE_OLLAMA_MODEL", runtime.DEFAULT_MODEL)
+    ok, detail = fallback_readiness(model)
+    if not ok:
+        banner("FALLBACK NOT READY")
+        print(detail, flush=True)
+        print("Claude ended because of a provider limit, but Ollama is not ready. Fix Ollama and run `claude` again.", flush=True)
+        return "exit", session_id, 78
+
     permission_mode = os.environ.get("CLAUDE_OLLAMA_PERMISSION_MODE", "acceptEdits")
-    remove(control / "return-request.json")
-    remove(control / "fallback-idle.json")
-    remove(control / "primary-ready.json")
+    for name in ("return-request.json", "fallback-idle.json", "primary-ready.json"):
+        remove(control / name)
 
     cmd = [real_claude(), "--model", model]
     if permission_mode == "bypassPermissions":
@@ -241,10 +236,10 @@ def run_ollama(
     try:
         while proc.poll() is None:
             if return_path.exists() or (ready_path.exists() and idle_path.exists()):
-                banner("CLAUDE IS AVAILABLE AGAIN. RETURNING AT A SAFE CHECKPOINT")
+                banner("CLAUDE AVAILABLE AGAIN. RETURNING AT SAFE CHECKPOINT")
                 stop_child(proc)
                 return "primary", session_id, 0
-            time.sleep(0.25)
+            time.sleep(0.2)
     finally:
         stop_probe.set()
     if ready_path.exists():
@@ -260,30 +255,25 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
     if any(arg in PASSTHROUGH_FLAGS for arg in claude_args):
         env = os.environ.copy()
         env["CLAUDE_CONTINUITY_INTERNAL"] = "1"
-        return subprocess.call(continuity.normalize_exec([real_claude(), *claude_args]), cwd=str(cwd_path), env=env)
+        return subprocess.call(runtime.normalize_exec([real_claude(), *claude_args]), cwd=str(cwd_path), env=env)
 
-    control = continuity.state_dir() / "supervisor" / f"{os.getpid()}"
+    control = runtime.state_dir() / "supervisor" / f"{os.getpid()}"
     control.mkdir(parents=True, exist_ok=True)
     clean_control(control)
 
-    ok, detail = continuity.ollama_available()
-    if not ok:
-        raise SystemExit(detail)
-    model = os.environ.get("CLAUDE_OLLAMA_MODEL", continuity.DEFAULT_MODEL)
-    ok, detail = continuity.model_available(model)
-    if not ok:
-        raise SystemExit(detail)
-
+    # Critical design rule: Claude starts even if Ollama is missing or broken.
+    # Ollama is checked lazily only after a real StopFailure requires fallback.
     session_id: str | None = None
     request: dict[str, Any] | None = None
     provider = "primary"
     first_args = list(claude_args)
+    heartbeat_stop = threading.Event()
+    heartbeat = threading.Thread(target=heartbeat_loop, args=(control, heartbeat_stop), daemon=True)
+    heartbeat.start()
     try:
         while True:
             if provider == "primary":
-                action, request, session_id, code = run_primary(
-                    str(cwd_path), control, session_id, first_args
-                )
+                action, request, session_id, code = run_primary(str(cwd_path), control, session_id, first_args)
                 first_args = []
                 if action == "fallback":
                     provider = "ollama"
@@ -293,15 +283,15 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
             if action == "primary":
                 provider = "primary"
                 request = None
-                remove(control / "primary-ready.json")
-                remove(control / "return-request.json")
-                remove(control / "fallback-idle.json")
+                for name in ("primary-ready.json", "return-request.json", "fallback-idle.json"):
+                    remove(control / name)
                 continue
             return code
     except KeyboardInterrupt:
         print("\nContinuity supervisor stopped by user.")
         return 130
     finally:
+        heartbeat_stop.set()
         clean_control(control)
         try:
             control.rmdir()
