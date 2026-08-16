@@ -1,12 +1,14 @@
 # Security
 
-This project launches a coding agent that can read and modify files in the current working directory.
+This project launches coding agents that can read and modify files in the current working directory.
 
-- Default fallback permission mode is `acceptEdits`.
-- `FULL_AUTO_ON_WINDOWS.bat` switches the fallback to `bypassPermissions`. That is intentionally **not** the default.
-- Use full-auto mode only inside repositories you trust and preferably inside a VM, sandbox, container, or disposable development environment.
-- The handoff prompt explicitly forbids exposing secrets and performing remote/destructive actions unless the original task required them.
-- Handoff files are stored locally and may contain recent Claude Code transcript text. Treat `%LOCALAPPDATA%\claude-ollama-continuity\state` as sensitive and do not commit or share it.
-- Review `.claude/settings.json` after installation if you already use custom hooks.
+- The Ollama fallback inherits the interrupted Claude session's permission mode by default. It does not silently grant itself broader permissions.
+- You may override the fallback permission mode with `CLAUDE_OLLAMA_PERMISSION_MODE`, but `bypassPermissions` removes normal approval boundaries and should only be used in an isolated environment you trust.
+- The handoff prompt explicitly tells the fallback not to expose secrets or perform remote, destructive, publishing, deployment, or account-level actions unless the original task explicitly required them.
+- Anthropic and Ollama use separate Claude Code sessions. They share repository files on disk, but model/session metadata is not reused across providers.
+- Recent transcript excerpts may be read locally to build provider handoffs. Treat Claude Code transcripts and `%LOCALAPPDATA%\claude-ollama-continuity\state` as sensitive.
+- The availability probe runs in an isolated directory and is marked so continuity hooks ignore it.
+- Installation merges only the three required user hooks into `~/.claude/settings.json` and creates a timestamped backup first.
+- Run `claude-continuity doctor` after upgrades and before relying on automatic takeover.
 
-To report a security problem, open a GitHub issue without including secrets, tokens, credentials, or private logs.
+To report a security problem, open a GitHub issue without including secrets, credentials, private source code, or private logs.
