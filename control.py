@@ -33,13 +33,12 @@ def read_json(path: pathlib.Path) -> dict[str, Any] | None:
         return None
 
 
-def active_control() -> pathlib.Path:
+def live_controls() -> list[pathlib.Path]:
     root = state_dir() / "supervisor"
     if not root.exists():
-        raise SystemExit("No active supervised Claude session found. Start `claude` in another terminal first.")
-
-    candidates: list[tuple[float, pathlib.Path]] = []
+        return []
     now = time.time()
+    live: list[tuple[float, pathlib.Path]] = []
     for path in root.iterdir():
         if not path.is_dir():
             continue
@@ -49,12 +48,56 @@ def active_control() -> pathlib.Path:
         except (TypeError, ValueError):
             epoch = 0
         if epoch and 0 <= now - epoch <= HEARTBEAT_MAX_AGE:
-            candidates.append((epoch, path))
+            live.append((epoch, path))
+    live.sort(reverse=True, key=lambda item: item[0])
+    return [path for _, path in live]
 
-    if not candidates:
-        raise SystemExit("No live supervised Claude session found. Start `claude` in another terminal first.")
-    candidates.sort(reverse=True, key=lambda item: item[0])
-    return candidates[0][1]
+
+def describe(path: pathlib.Path) -> str:
+    heartbeat = read_json(path / "heartbeat.json") or {}
+    current = read_json(path / "current-session.json") or {}
+    pid = heartbeat.get("pid") or path.name
+    provider = current.get("provider") or "starting"
+    cwd = current.get("cwd") or "(session has not emitted a hook yet)"
+    session_id = current.get("session_id") or "(unknown)"
+    return f"PID {pid} | {provider} | {cwd} | session {session_id}"
+
+
+def sessions() -> int:
+    live = live_controls()
+    if not live:
+        print("No live supervised Claude sessions found.")
+        return 1
+    print("Live supervised Claude sessions:")
+    for path in live:
+        print("  " + describe(path))
+    return 0
+
+
+def active_control(pid: int | None = None) -> pathlib.Path:
+    live = live_controls()
+    if not live:
+        raise SystemExit("No live supervised Claude session found. Start `claude` first.")
+
+    if pid is not None:
+        target = str(pid)
+        for path in live:
+            heartbeat = read_json(path / "heartbeat.json") or {}
+            actual = str(heartbeat.get("pid") or path.name)
+            if actual == target:
+                return path
+        available = "\n".join("  " + describe(path) for path in live)
+        raise SystemExit(f"Supervisor PID {pid} is not live. Available sessions:\n{available}")
+
+    if len(live) == 1:
+        return live[0]
+
+    available = "\n".join("  " + describe(path) for path in live)
+    raise SystemExit(
+        "Multiple live supervised Claude sessions found. Refusing to guess.\n"
+        + available
+        + "\nRun `claude-continuity simulate-limit --pid <PID>` for the exact target."
+    )
 
 
 def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None:
@@ -64,8 +107,8 @@ def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None
     os.replace(tmp, final)
 
 
-def simulate_limit() -> int:
-    root = active_control()
+def simulate_limit(pid: int | None = None) -> int:
+    root = active_control(pid)
     current = read_json(root / "current-session.json") or {}
     payload = {
         "created_at": now_iso(),
@@ -78,29 +121,27 @@ def simulate_limit() -> int:
         "simulated": True,
     }
     write_signal(root, "fallback-request.json", payload)
-    print("SIMULATED LIMIT SENT")
-    print("Watch the terminal where `claude` is running. It should switch to OLLAMA ACTIVE.")
+    print(f"SIMULATED LIMIT SENT TO SUPERVISOR PID {root.name}")
+    print("Watch that Claude terminal. It should switch to OLLAMA ACTIVE.")
     return 0
 
 
-def simulate_recovery() -> int:
-    root = active_control()
+def simulate_recovery(pid: int | None = None) -> int:
+    root = active_control(pid)
     payload = {
         "created_at": now_iso(),
         "probe": "SIMULATION ONLY: forced Claude recovery",
         "simulated": True,
     }
-    # Match real recovery behavior. Only mark Anthropic as reachable.
-    # The supervisor returns after Ollama reaches its next Stop/idle checkpoint.
     write_signal(root, "primary-ready.json", payload)
-    print("SIMULATED RECOVERY SENT")
+    print(f"SIMULATED RECOVERY SENT TO SUPERVISOR PID {root.name}")
     print("Claude is marked available. Ollama will return at its next safe Stop/idle checkpoint.")
     return 0
 
 
-def status() -> int:
-    root = active_control()
-    print(f"Active supervisor: {root}")
+def status(pid: int | None = None) -> int:
+    root = active_control(pid)
+    print("Active supervisor: " + describe(root))
     for name in (
         "heartbeat.json",
         "current-session.json",
@@ -114,19 +155,29 @@ def status() -> int:
     return 0
 
 
+def add_pid_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--pid", type=int, default=None, help="Exact supervisor PID to target")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="claude-continuity")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("simulate-limit")
-    sub.add_parser("simulate-recovery")
-    sub.add_parser("supervisor-status")
+    limit_parser = sub.add_parser("simulate-limit")
+    add_pid_argument(limit_parser)
+    recovery_parser = sub.add_parser("simulate-recovery")
+    add_pid_argument(recovery_parser)
+    status_parser = sub.add_parser("supervisor-status")
+    add_pid_argument(status_parser)
+    sub.add_parser("sessions")
     args = parser.parse_args(argv)
     if args.cmd == "simulate-limit":
-        return simulate_limit()
+        return simulate_limit(args.pid)
     if args.cmd == "simulate-recovery":
-        return simulate_recovery()
+        return simulate_recovery(args.pid)
     if args.cmd == "supervisor-status":
-        return status()
+        return status(args.pid)
+    if args.cmd == "sessions":
+        return sessions()
     return 2
 
 
