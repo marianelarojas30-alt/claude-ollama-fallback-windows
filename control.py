@@ -1,36 +1,26 @@
 #!/usr/bin/env python3
-"""Control helpers for testing the same-terminal continuity supervisor."""
+"""Diagnostics and explicit test controls for Claude/Ollama continuity."""
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import time
 from typing import Any
 
-APP = "claude-ollama-continuity"
+import runtime
+
 HEARTBEAT_MAX_AGE = 5.0
 
 
-def now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
-
-
 def state_dir() -> pathlib.Path:
-    local = pathlib.Path(os.environ.get("LOCALAPPDATA", pathlib.Path.home() / "AppData" / "Local"))
-    root = local / APP / "state"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return runtime.state_dir()
 
 
 def read_json(path: pathlib.Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
+    return runtime.read_json(path)
 
 
 def live_controls() -> list[pathlib.Path]:
@@ -55,11 +45,12 @@ def live_controls() -> list[pathlib.Path]:
 
 def describe(path: pathlib.Path) -> str:
     heartbeat = read_json(path / "heartbeat.json") or {}
+    supervisor = read_json(path / "supervisor.json") or {}
     current = read_json(path / "current-session.json") or {}
-    pid = heartbeat.get("pid") or path.name
+    pid = heartbeat.get("pid") or supervisor.get("pid") or path.name
     provider = current.get("provider") or "starting"
-    cwd = current.get("cwd") or "(session has not emitted a hook yet)"
-    session_id = current.get("session_id") or "(unknown)"
+    cwd = current.get("cwd") or heartbeat.get("cwd") or supervisor.get("cwd") or "(unknown cwd)"
+    session_id = current.get("session_id") or "(session id pending)"
     return f"PID {pid} | {provider} | {cwd} | session {session_id}"
 
 
@@ -96,7 +87,7 @@ def active_control(pid: int | None = None) -> pathlib.Path:
     raise SystemExit(
         "Multiple live supervised Claude sessions found. Refusing to guess.\n"
         + available
-        + "\nRun `claude-continuity simulate-limit --pid <PID>` for the exact target."
+        + "\nUse --pid <PID> to target the exact session."
     )
 
 
@@ -110,10 +101,12 @@ def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None
 def simulate_limit(pid: int | None = None) -> int:
     root = active_control(pid)
     current = read_json(root / "current-session.json") or {}
+    supervisor = read_json(root / "supervisor.json") or {}
     payload = {
-        "created_at": now_iso(),
+        "created_at": runtime.now_iso(),
         "session_id": current.get("session_id"),
-        "cwd": current.get("cwd") or os.getcwd(),
+        "cwd": current.get("cwd") or supervisor.get("cwd") or os.getcwd(),
+        "permission_mode": current.get("permission_mode"),
         "error": "rate_limit",
         "error_details": "SIMULATION ONLY: forced rate_limit for continuity test",
         "transcript_path": current.get("transcript_path"),
@@ -122,20 +115,23 @@ def simulate_limit(pid: int | None = None) -> int:
     }
     write_signal(root, "fallback-request.json", payload)
     print(f"SIMULATED LIMIT SENT TO SUPERVISOR PID {root.name}")
-    print("Watch that Claude terminal. It should switch to OLLAMA ACTIVE.")
+    print("Watch that terminal. It should switch from CLAUDE ACTIVE to OLLAMA ACTIVE.")
     return 0
 
 
 def simulate_recovery(pid: int | None = None) -> int:
     root = active_control(pid)
-    payload = {
-        "created_at": now_iso(),
-        "probe": "SIMULATION ONLY: forced Claude recovery",
-        "simulated": True,
-    }
-    write_signal(root, "primary-ready.json", payload)
+    write_signal(
+        root,
+        "primary-ready.json",
+        {
+            "created_at": runtime.now_iso(),
+            "probe": "SIMULATION ONLY: forced Claude recovery",
+            "simulated": True,
+        },
+    )
     print(f"SIMULATED RECOVERY SENT TO SUPERVISOR PID {root.name}")
-    print("Claude is marked available. Ollama will return at its next safe Stop/idle checkpoint.")
+    print("Claude is marked available. Return waits for Ollama's next safe Stop/idle checkpoint.")
     return 0
 
 
@@ -144,14 +140,87 @@ def status(pid: int | None = None) -> int:
     print("Active supervisor: " + describe(root))
     for name in (
         "heartbeat.json",
+        "supervisor.json",
         "current-session.json",
         "fallback-request.json",
         "fallback-idle.json",
         "primary-ready.json",
         "return-request.json",
     ):
-        path = root / name
-        print(f"{name}: {'present' if path.exists() else 'absent'}")
+        print(f"{name}: {'present' if (root / name).exists() else 'absent'}")
+    return 0
+
+
+def _hook_configured() -> tuple[bool, str]:
+    settings = pathlib.Path.home() / ".claude" / "settings.json"
+    if not settings.exists():
+        return False, f"settings not found: {settings}"
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"settings unreadable: {exc}"
+    hooks = data.get("hooks", {})
+    marker = str(runtime.install_dir() / "supervisor_hook.py")
+    required = ("StopFailure", "Stop", "UserPromptSubmit")
+    missing = [event for event in required if marker not in json.dumps(hooks.get(event, []))]
+    if missing:
+        return False, "missing hook events: " + ", ".join(missing)
+    return True, "StopFailure, Stop and UserPromptSubmit configured"
+
+
+def _wrapper_first() -> tuple[bool, str]:
+    wrapper = runtime.install_dir() / "bin" / ("claude.cmd" if os.name == "nt" else "claude")
+    resolved = shutil.which("claude")
+    if not resolved:
+        return False, "claude is not resolvable from PATH"
+    try:
+        same = pathlib.Path(resolved).resolve() == wrapper.resolve()
+    except OSError:
+        same = os.path.normcase(resolved) == os.path.normcase(str(wrapper))
+    return same, f"resolved={resolved}; expected={wrapper}"
+
+
+def doctor() -> int:
+    config = runtime.config()
+    model = os.environ.get("CLAUDE_OLLAMA_MODEL", runtime.DEFAULT_MODEL)
+    checks: list[tuple[str, bool, str]] = []
+
+    runtime_files = ("continuity.py", "runtime.py", "supervisor.py", "supervisor_hook.py", "control.py", "updater.py")
+    missing = [name for name in runtime_files if not (runtime.install_dir() / name).exists()]
+    checks.append(("Installed runtime", not missing, "complete" if not missing else "missing: " + ", ".join(missing)))
+
+    ok, detail = _wrapper_first()
+    checks.append(("Global claude wrapper", ok, detail))
+
+    ok, detail = runtime.claude_available()
+    checks.append(("Real Claude Code", ok, detail))
+
+    ok, detail = runtime.ollama_available()
+    checks.append(("Ollama", ok, detail.splitlines()[0] if detail else "available"))
+
+    ok, detail = runtime.model_available(model)
+    checks.append((f"Ollama model {model}", ok, detail))
+
+    ok, detail = _hook_configured()
+    checks.append(("Claude hooks", ok, detail))
+
+    print(f"Claude Ollama Continuity {runtime.VERSION}")
+    print(f"Installed commit: {config.get('installed_commit') or '(unknown / pre-1.0 install)'}")
+    print(f"Install dir: {runtime.install_dir()}\n")
+    for name, passed, detail in checks:
+        print(f"{'OK' if passed else 'FAIL':4}  {name}: {detail}")
+
+    if all(item[1] for item in checks):
+        print("\nREADY: automatic Claude -> Ollama -> Claude continuity is configured.")
+        return 0
+    print("\nNOT READY: fix the FAIL items before relying on automatic takeover.")
+    return 1
+
+
+def version() -> int:
+    config = runtime.config()
+    print(f"Claude Ollama Continuity {runtime.VERSION}")
+    print(f"Installed commit: {config.get('installed_commit') or '(unknown)'}")
     return 0
 
 
@@ -162,22 +231,29 @@ def add_pid_argument(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="claude-continuity")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor")
+    sub.add_parser("version")
+    sub.add_parser("sessions")
     limit_parser = sub.add_parser("simulate-limit")
     add_pid_argument(limit_parser)
     recovery_parser = sub.add_parser("simulate-recovery")
     add_pid_argument(recovery_parser)
     status_parser = sub.add_parser("supervisor-status")
     add_pid_argument(status_parser)
-    sub.add_parser("sessions")
     args = parser.parse_args(argv)
+
+    if args.cmd == "doctor":
+        return doctor()
+    if args.cmd == "version":
+        return version()
+    if args.cmd == "sessions":
+        return sessions()
     if args.cmd == "simulate-limit":
         return simulate_limit(args.pid)
     if args.cmd == "simulate-recovery":
         return simulate_recovery(args.pid)
     if args.cmd == "supervisor-status":
         return status(args.pid)
-    if args.cmd == "sessions":
-        return sessions()
     return 2
 
 
