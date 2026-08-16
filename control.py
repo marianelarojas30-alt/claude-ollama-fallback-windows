@@ -7,10 +7,11 @@ import datetime as dt
 import json
 import os
 import pathlib
-import sys
+import time
 from typing import Any
 
 APP = "claude-ollama-continuity"
+HEARTBEAT_MAX_AGE = 5.0
 
 
 def now_iso() -> str:
@@ -24,23 +25,36 @@ def state_dir() -> pathlib.Path:
     return root
 
 
-def active_control() -> pathlib.Path:
-    root = state_dir() / "supervisor"
-    if not root.exists():
-        raise SystemExit("No active supervised Claude session found. Start `claude` in another terminal first.")
-    dirs = [p for p in root.iterdir() if p.is_dir()]
-    if not dirs:
-        raise SystemExit("No active supervised Claude session found. Start `claude` in another terminal first.")
-    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return dirs[0]
-
-
 def read_json(path: pathlib.Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def active_control() -> pathlib.Path:
+    root = state_dir() / "supervisor"
+    if not root.exists():
+        raise SystemExit("No active supervised Claude session found. Start `claude` in another terminal first.")
+
+    candidates: list[tuple[float, pathlib.Path]] = []
+    now = time.time()
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        heartbeat = read_json(path / "heartbeat.json") or {}
+        try:
+            epoch = float(heartbeat.get("epoch", 0))
+        except (TypeError, ValueError):
+            epoch = 0
+        if epoch and now - epoch <= HEARTBEAT_MAX_AGE:
+            candidates.append((epoch, path))
+
+    if not candidates:
+        raise SystemExit("No live supervised Claude session found. Start `claude` in another terminal first.")
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None:
@@ -87,6 +101,7 @@ def status() -> int:
     root = active_control()
     print(f"Active supervisor: {root}")
     for name in (
+        "heartbeat.json",
         "current-session.json",
         "fallback-request.json",
         "fallback-idle.json",
