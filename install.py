@@ -99,9 +99,8 @@ def ensure_user_path_windows(directory: pathlib.Path) -> None:
     if os.name != "nt":
         return
     current = os.environ.get("PATH", "")
-    pieces = current.split(os.pathsep)
     target = str(directory)
-    if not any(piece.lower() == target.lower() for piece in pieces if piece):
+    if not any(piece.lower() == target.lower() for piece in current.split(os.pathsep) if piece):
         os.environ["PATH"] = target + os.pathsep + current
     try:
         proc = subprocess.run(
@@ -137,13 +136,22 @@ def main() -> int:
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 
     real_claude = find_real_claude()
-    config = {
-        "real_claude": real_claude,
-        "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
-    }
-    atomic_write_json(INSTALL_DIR / "config.json", config)
+    atomic_write_json(
+        INSTALL_DIR / "config.json",
+        {
+            "real_claude": real_claude,
+            "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
+        },
+    )
 
-    files = ["continuity.py", "supervisor.py", "supervisor_hook.py", "install.py", "updater.py"]
+    files = [
+        "continuity.py",
+        "supervisor.py",
+        "supervisor_hook.py",
+        "control.py",
+        "install.py",
+        "updater.py",
+    ]
     for name in files:
         source = ROOT / name
         if source.exists():
@@ -152,21 +160,28 @@ def main() -> int:
     target = INSTALL_DIR / "continuity.py"
     supervisor = INSTALL_DIR / "supervisor.py"
     hook_target = INSTALL_DIR / "supervisor_hook.py"
+    control = INSTALL_DIR / "control.py"
     updater = INSTALL_DIR / "updater.py"
 
     if os.name != "nt":
-        for path in (target, supervisor, hook_target, updater):
+        for path in (target, supervisor, hook_target, control, updater):
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     if os.name == "nt":
         continuity_launcher = BIN_DIR / "claude-continuity.cmd"
         continuity_launcher.write_text(
-            f'@echo off\r\nif /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n) else (\r\n  "{sys.executable}" "{target}" %*\r\n)\r\n',
+            f'@echo off\r\n'
+            f'if /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
+            f'if /I "%~1"=="simulate-limit" (\r\n  "{sys.executable}" "{control}" simulate-limit\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
+            f'if /I "%~1"=="simulate-recovery" (\r\n  "{sys.executable}" "{control}" simulate-recovery\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
+            f'if /I "%~1"=="supervisor-status" (\r\n  "{sys.executable}" "{control}" supervisor-status\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
+            f'"{sys.executable}" "{target}" %*\r\n',
             encoding="utf-8",
         )
         smart_launcher = BIN_DIR / "smart-claude.cmd"
         smart_launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n', encoding="utf-8"
+            f'@echo off\r\n"{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n',
+            encoding="utf-8",
         )
         global_claude = BIN_DIR / "claude.cmd"
         global_claude.write_text(
@@ -177,13 +192,19 @@ def main() -> int:
     else:
         continuity_launcher = BIN_DIR / "claude-continuity"
         continuity_launcher.write_text(
-            f'#!/bin/sh\nif [ "$1" = "update" ]; then exec "{sys.executable}" "{updater}"; fi\nexec "{sys.executable}" "{target}" "$@"\n',
+            f'#!/bin/sh\n'
+            f'case "$1" in\n'
+            f'  update) exec "{sys.executable}" "{updater}" ;;\n'
+            f'  simulate-limit|simulate-recovery|supervisor-status) exec "{sys.executable}" "{control}" "$1" ;;\n'
+            f'esac\n'
+            f'exec "{sys.executable}" "{target}" "$@"\n',
             encoding="utf-8",
         )
         continuity_launcher.chmod(0o755)
         smart_launcher = BIN_DIR / "smart-claude"
         smart_launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD" -- "$@"\n', encoding="utf-8"
+            f'#!/bin/sh\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD" -- "$@"\n',
+            encoding="utf-8",
         )
         smart_launcher.chmod(0o755)
         global_claude = smart_launcher
@@ -223,6 +244,7 @@ def main() -> int:
     print(f"Settings:         {SETTINGS}")
     print("\nOpen a NEW terminal. From then on use: claude")
     print("Future upgrades: claude-continuity update")
+    print("Test commands:   claude-continuity simulate-limit / simulate-recovery")
     return 0
 
 
