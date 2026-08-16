@@ -16,6 +16,15 @@ ROOT = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path.home()
 CLAUDE_DIR = HOME / ".claude"
 SETTINGS = CLAUDE_DIR / "settings.json"
+RUNTIME_FILES = (
+    "continuity.py",
+    "runtime.py",
+    "supervisor.py",
+    "supervisor_hook.py",
+    "control.py",
+    "install.py",
+    "updater.py",
+)
 
 if os.name == "nt":
     LOCAL = pathlib.Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local"))
@@ -147,6 +156,28 @@ def find_ollama_windows() -> pathlib.Path | None:
     return None
 
 
+def verify_installed_runtime() -> None:
+    missing = [name for name in RUNTIME_FILES if not (INSTALL_DIR / name).exists()]
+    if missing:
+        raise SystemExit("INSTALL VERIFY FAILED: missing " + ", ".join(missing))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runtime, supervisor, supervisor_hook, control; print('runtime import OK')",
+        ],
+        cwd=str(INSTALL_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit("INSTALL VERIFY FAILED: " + (proc.stdout.strip() or "runtime import error"))
+    print("Runtime verification: OK")
+
+
 def main() -> int:
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -169,19 +200,11 @@ def main() -> int:
         },
     )
 
-    files = [
-        "continuity.py",
-        "runtime.py",
-        "supervisor.py",
-        "supervisor_hook.py",
-        "control.py",
-        "install.py",
-        "updater.py",
-    ]
-    for name in files:
+    for name in RUNTIME_FILES:
         source = ROOT / name
-        if source.exists():
-            shutil.copy2(source, INSTALL_DIR / name)
+        if not source.exists():
+            raise SystemExit(f"Installer source missing required file: {name}")
+        shutil.copy2(source, INSTALL_DIR / name)
 
     target = INSTALL_DIR / "continuity.py"
     runtime_target = INSTALL_DIR / "runtime.py"
@@ -264,6 +287,8 @@ def main() -> int:
         print(f"Backup: {backup}")
 
     atomic_write_json(SETTINGS, data)
+    verify_installed_runtime()
+
     print("\nINSTALLED / UPDATED OK")
     print(f"Real Claude:      {real_claude}")
     print(f"Global wrapper:   {global_claude}")
