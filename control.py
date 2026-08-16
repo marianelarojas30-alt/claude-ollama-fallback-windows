@@ -7,6 +7,9 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from typing import Any
 
@@ -69,7 +72,6 @@ def active_control(pid: int | None = None) -> pathlib.Path:
     live = live_controls()
     if not live:
         raise SystemExit("No live supervised Claude session found. Start `claude` first.")
-
     if pid is not None:
         target = str(pid)
         for path in live:
@@ -79,10 +81,8 @@ def active_control(pid: int | None = None) -> pathlib.Path:
                 return path
         available = "\n".join("  " + describe(path) for path in live)
         raise SystemExit(f"Supervisor PID {pid} is not live. Available sessions:\n{available}")
-
     if len(live) == 1:
         return live[0]
-
     available = "\n".join("  " + describe(path) for path in live)
     raise SystemExit(
         "Multiple live supervised Claude sessions found. Refusing to guess.\n"
@@ -92,6 +92,7 @@ def active_control(pid: int | None = None) -> pathlib.Path:
 
 
 def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
     tmp = root / f"{name}.tmp"
     final = root / name
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -102,18 +103,21 @@ def simulate_limit(pid: int | None = None) -> int:
     root = active_control(pid)
     current = read_json(root / "current-session.json") or {}
     supervisor = read_json(root / "supervisor.json") or {}
-    payload = {
-        "created_at": runtime.now_iso(),
-        "session_id": current.get("session_id"),
-        "cwd": current.get("cwd") or supervisor.get("cwd") or os.getcwd(),
-        "permission_mode": current.get("permission_mode"),
-        "error": "rate_limit",
-        "error_details": "SIMULATION ONLY: forced rate_limit for continuity test",
-        "transcript_path": current.get("transcript_path"),
-        "last_assistant_message": None,
-        "simulated": True,
-    }
-    write_signal(root, "fallback-request.json", payload)
+    write_signal(
+        root,
+        "fallback-request.json",
+        {
+            "created_at": runtime.now_iso(),
+            "session_id": current.get("session_id"),
+            "cwd": current.get("cwd") or supervisor.get("cwd") or os.getcwd(),
+            "permission_mode": current.get("permission_mode"),
+            "error": "rate_limit",
+            "error_details": "SIMULATION ONLY: forced rate_limit for continuity test",
+            "transcript_path": current.get("transcript_path"),
+            "last_assistant_message": None,
+            "simulated": True,
+        },
+    )
     print(f"SIMULATED LIMIT SENT TO SUPERVISOR PID {root.name}")
     print("Watch that terminal. It should switch from CLAUDE ACTIVE to OLLAMA ACTIVE.")
     return 0
@@ -123,15 +127,11 @@ def simulate_recovery(pid: int | None = None) -> int:
     root = active_control(pid)
     write_signal(
         root,
-        "primary-ready.json",
-        {
-            "created_at": runtime.now_iso(),
-            "probe": "SIMULATION ONLY: forced Claude recovery",
-            "simulated": True,
-        },
+        "force-return.json",
+        {"created_at": runtime.now_iso(), "simulated": True},
     )
-    print(f"SIMULATED RECOVERY SENT TO SUPERVISOR PID {root.name}")
-    print("Claude is marked available. Return waits for Ollama's next safe Stop/idle checkpoint.")
+    print(f"SAFE RETURN REQUESTED FOR SUPERVISOR PID {root.name}")
+    print("The supervisor will retry the real interactive Claude session at Ollama's next safe Stop.")
     return 0
 
 
@@ -144,8 +144,7 @@ def status(pid: int | None = None) -> int:
         "current-session.json",
         "fallback-request.json",
         "fallback-idle.json",
-        "primary-ready.json",
-        "return-request.json",
+        "force-return.json",
     ):
         print(f"{name}: {'present' if (root / name).exists() else 'absent'}")
     return 0
@@ -184,23 +183,25 @@ def doctor() -> int:
     config = runtime.config()
     model = os.environ.get("CLAUDE_OLLAMA_MODEL", runtime.DEFAULT_MODEL)
     checks: list[tuple[str, bool, str]] = []
-
-    runtime_files = ("continuity.py", "runtime.py", "supervisor.py", "supervisor_hook.py", "control.py", "updater.py")
+    runtime_files = (
+        "continuity.py",
+        "runtime.py",
+        "supervisor.py",
+        "supervisor_hook.py",
+        "control.py",
+        "install.py",
+        "updater.py",
+    )
     missing = [name for name in runtime_files if not (runtime.install_dir() / name).exists()]
     checks.append(("Installed runtime", not missing, "complete" if not missing else "missing: " + ", ".join(missing)))
-
     ok, detail = _wrapper_first()
     checks.append(("Global claude wrapper", ok, detail))
-
     ok, detail = runtime.claude_available()
     checks.append(("Real Claude Code", ok, detail))
-
     ok, detail = runtime.ollama_available()
     checks.append(("Ollama", ok, detail.splitlines()[0] if detail else "available"))
-
     ok, detail = runtime.model_available(model)
     checks.append((f"Ollama model {model}", ok, detail))
-
     ok, detail = _hook_configured()
     checks.append(("Claude hooks", ok, detail))
 
@@ -209,12 +210,107 @@ def doctor() -> int:
     print(f"Install dir: {runtime.install_dir()}\n")
     for name, passed, detail in checks:
         print(f"{'OK' if passed else 'FAIL':4}  {name}: {detail}")
-
     if all(item[1] for item in checks):
-        print("\nREADY: automatic Claude -> Ollama -> Claude continuity is configured.")
+        print("\nREADY: static configuration is complete. Run `claude-continuity self-test` once.")
         return 0
     print("\nNOT READY: fix the FAIL items before relying on automatic takeover.")
     return 1
+
+
+def _test_hook(temp_root: pathlib.Path) -> tuple[bool, str]:
+    control = temp_root / "hook-control"
+    control.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CLAUDE_CONTINUITY_SUPERVISED": "1",
+            "CLAUDE_CONTINUITY_PROVIDER": "anthropic",
+            "CLAUDE_CONTINUITY_CONTROL_DIR": str(control),
+        }
+    )
+    payload = {
+        "hook_event_name": "StopFailure",
+        "session_id": "self-test-session",
+        "cwd": str(temp_root),
+        "permission_mode": "default",
+        "error": "rate_limit",
+        "error_details": "self-test",
+    }
+    proc = subprocess.run(
+        [sys.executable, str(runtime.install_dir() / "supervisor_hook.py")],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    signal = control / "fallback-request.json"
+    if proc.returncode != 0 or not signal.exists():
+        return False, proc.stdout.strip() or "fallback-request.json was not created"
+    data = read_json(signal) or {}
+    return data.get("error") == "rate_limit", "StopFailure signal created"
+
+
+def _test_ollama_through_claude(temp_root: pathlib.Path) -> tuple[bool, str]:
+    model = os.environ.get("CLAUDE_OLLAMA_MODEL", runtime.DEFAULT_MODEL)
+    real = runtime.real_claude_executable()
+    if not real:
+        return False, "real Claude executable unavailable"
+    control = temp_root / "ollama-control"
+    control.mkdir(parents=True, exist_ok=True)
+    env = runtime.fallback_environment(control)
+    env["CLAUDE_CONTINUITY_PROBE"] = "1"
+    cmd = [
+        real,
+        "--model",
+        model,
+        "-p",
+        "Reply exactly READY and do not use tools.",
+        "--max-turns",
+        "1",
+        "--output-format",
+        "json",
+    ]
+    try:
+        proc = subprocess.run(
+            runtime.normalize_exec(cmd),
+            cwd=str(temp_root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Claude Code -> Ollama timed out after 180 seconds"
+    output = proc.stdout.strip()
+    if proc.returncode != 0:
+        return False, output[-3000:] or f"exit code {proc.returncode}"
+    return True, "Claude Code successfully completed a local Ollama request"
+
+
+def self_test() -> int:
+    if doctor() != 0:
+        print("\nSELF-TEST ABORTED: static checks are not ready.")
+        return 1
+    print("\nRunning local end-to-end checks. This may take a minute while the Ollama model loads...\n")
+    with tempfile.TemporaryDirectory(prefix="claude-continuity-selftest-") as tempdir:
+        root = pathlib.Path(tempdir)
+        hook_ok, hook_detail = _test_hook(root)
+        print(f"{'PASS' if hook_ok else 'FAIL'}  StopFailure hook: {hook_detail}")
+        if not hook_ok:
+            return 1
+        ollama_ok, ollama_detail = _test_ollama_through_claude(root)
+        print(f"{'PASS' if ollama_ok else 'FAIL'}  Claude Code -> Ollama: {ollama_detail}")
+        if not ollama_ok:
+            return 1
+    print("\nSELF-TEST PASS: the local takeover path is operational.")
+    print("A real Anthropic quota exhaustion can only be proven when Anthropic actually returns StopFailure.")
+    return 0
 
 
 def version() -> int:
@@ -232,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="claude-continuity")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor")
+    sub.add_parser("self-test")
     sub.add_parser("version")
     sub.add_parser("sessions")
     limit_parser = sub.add_parser("simulate-limit")
@@ -244,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "doctor":
         return doctor()
+    if args.cmd == "self-test":
+        return self_test()
     if args.cmd == "version":
         return version()
     if args.cmd == "sessions":
