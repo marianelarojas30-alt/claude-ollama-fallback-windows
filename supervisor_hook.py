@@ -60,6 +60,20 @@ def handle(payload: dict[str, Any]) -> int:
     event = str(payload.get("hook_event_name") or "")
     provider = os.environ.get("CLAUDE_CONTINUITY_PROVIDER", "")
 
+    # Persist the active Claude session on every supervised lifecycle event so
+    # testing and provider handoffs can resume the exact same conversation.
+    write_signal(
+        "current-session.json",
+        {
+            "updated_at": now_iso(),
+            "session_id": payload.get("session_id"),
+            "cwd": payload.get("cwd") or os.getcwd(),
+            "transcript_path": payload.get("transcript_path"),
+            "provider": provider,
+            "event": event,
+        },
+    )
+
     if provider == "ollama":
         if event == "UserPromptSubmit":
             remove_signal("fallback-idle.json")
