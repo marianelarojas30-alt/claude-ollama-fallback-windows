@@ -1,0 +1,27 @@
+CLAUDE -> OLLAMA FALLBACK FOR WINDOWS
+=====================================
+
+1. Install Claude Code, Ollama, Git, and Python 3.
+2. Double-click INSTALL_WINDOWS.bat
+3. Double-click PULL_MODEL_WINDOWS.bat
+4. Double-click CHECK_WINDOWS.bat
+5. Optional: double-click TEST_TAKEOVER_WINDOWS.bat
+
+NORMAL USE
+----------
+Use Claude Code normally.
+When a supported Claude API StopFailure occurs, the hook creates a handoff and starts Claude Code against Ollama in the SAME working directory.
+
+DEFAULT FALLBACK MODEL
+----------------------
+qwen3.5
+
+CHANGE MODEL
+------------
+PowerShell example:
+setx CLAUDE_OLLAMA_MODEL qwen3.5
+
+SECURITY
+--------
+The default mode is acceptEdits.
+Do NOT enable FULL_AUTO_ON_WINDOWS.bat unless you understand that it allows the fallback agent to execute commands without approval.
