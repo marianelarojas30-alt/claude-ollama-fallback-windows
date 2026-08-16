@@ -12,11 +12,14 @@ import threading
 import time
 from typing import Any
 
+import continuity
 import runtime
 
 POLL_SECONDS = max(30, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_SECONDS", "300")))
 PROBE_TIMEOUT = max(15, int(os.environ.get("CLAUDE_CONTINUITY_PROBE_TIMEOUT", "60")))
 PASSTHROUGH_FLAGS = {"--help", "-h", "--version", "-v"}
+HANDOFF_CHARS = max(4000, int(os.environ.get("CLAUDE_CONTINUITY_HANDOFF_CHARS", "30000")))
+HANDBACK_CHARS = max(4000, int(os.environ.get("CLAUDE_CONTINUITY_HANDBACK_CHARS", "30000")))
 
 
 def banner(text: str) -> None:
@@ -159,48 +162,97 @@ def probe_primary(control: pathlib.Path, stop_event: threading.Event) -> None:
             return
 
 
+def build_primary_command(
+    primary_session_id: str | None,
+    initial_args: list[str],
+    handback_prompt: str | None = None,
+) -> list[str]:
+    cmd = [real_claude()]
+    if primary_session_id:
+        cmd.extend(["--resume", primary_session_id])
+        if handback_prompt:
+            cmd.append(handback_prompt)
+    else:
+        cmd.extend(initial_args)
+    return cmd
+
+
 def run_primary(
     cwd: str,
     control: pathlib.Path,
-    session_id: str | None,
+    primary_session_id: str | None,
     initial_args: list[str],
+    handback_prompt: str | None = None,
 ) -> tuple[str, dict[str, Any] | None, str | None, int]:
     remove(control / "fallback-request.json")
-    cmd = [real_claude()]
-    if session_id:
-        cmd.extend(["--resume", session_id])
-    else:
-        cmd.extend(initial_args)
+    cmd = build_primary_command(primary_session_id, initial_args, handback_prompt)
     banner("CLAUDE ACTIVE")
     proc = spawn_visible(cmd, cwd, child_env(control, "anthropic"))
     request_path = control / "fallback-request.json"
     while proc.poll() is None:
         if request_path.exists():
             request = read_json(request_path) or {}
-            new_session = str(request.get("session_id") or session_id or "") or None
+            captured_primary = str(request.get("session_id") or primary_session_id or "") or None
             banner(f"CLAUDE LIMIT DETECTED ({request.get('error', 'unknown')})")
             stop_child(proc)
-            return "fallback", request, new_session, 0
+            return "fallback", request, captured_primary, 0
         time.sleep(0.2)
-    return "exit", None, session_id, int(proc.returncode or 0)
+    return "exit", None, primary_session_id, int(proc.returncode or 0)
 
 
-def fallback_prompt(request: dict[str, Any] | None) -> str:
+def fallback_prompt(cwd: str, request: dict[str, Any] | None) -> str:
     request = request or {}
+    transcript = continuity.extract_transcript(request.get("transcript_path"), limit=HANDOFF_CHARS)
+    snapshot = continuity.git_snapshot(cwd)
     details = request.get("error_details") or "Claude provider limit"
-    return (
-        "Continue the exact unfinished coding task from this session. "
-        "Claude became unavailable, so you are the Ollama fallback. "
-        "Inspect the current repository and conversation before acting. "
-        "Do not restart completed work. Preserve unrelated user changes. "
-        f"Previous provider failure: {details}."
-    )
+    return f"""You are the temporary Ollama fallback for an interrupted Claude Code session.
+
+The Anthropic session stopped because of: {request.get('error', 'unknown')}.
+Details: {details}
+
+Continue the exact unfinished task in the current repository. The files on disk are the source of truth. Inspect the repository before changing anything. Do not restart completed work. Preserve unrelated user changes. Run relevant checks for work you change. Do not commit, push, publish, deploy, or delete remote data unless the original task explicitly required it.
+
+IMPORTANT SESSION RULE
+You are running in a separate Ollama-backed Claude Code session. Do not try to resume or modify the original Anthropic session. Your work will be handed back through the repository state and transcript.
+
+CURRENT REPOSITORY SNAPSHOT
+{snapshot}
+
+RECENT ANTHROPIC TRANSCRIPT
+{transcript}
+"""
+
+
+def build_ollama_command(model: str, permission_mode: str, prompt: str) -> list[str]:
+    cmd = [real_claude(), "--model", model]
+    if permission_mode == "bypassPermissions":
+        cmd.append("--dangerously-skip-permissions")
+    else:
+        cmd.extend(["--permission-mode", permission_mode])
+    cmd.append(prompt)
+    return cmd
+
+
+def build_handback_prompt(cwd: str, control: pathlib.Path) -> str:
+    current = read_json(control / "current-session.json") or {}
+    transcript_path = current.get("transcript_path") if current.get("provider") == "ollama" else None
+    transcript = continuity.extract_transcript(transcript_path, limit=HANDBACK_CHARS)
+    snapshot = continuity.git_snapshot(cwd)
+    return f"""The Anthropic session is resuming after a temporary Ollama fallback.
+
+The Ollama worker ran in a separate Claude Code session so your original Anthropic session and model metadata stayed intact. Continue the user's unfinished task from the current repository state. Review what changed on disk before doing more work. Do not redo completed work. Preserve unrelated user changes.
+
+CURRENT REPOSITORY SNAPSHOT AFTER OLLAMA
+{snapshot}
+
+RECENT OLLAMA FALLBACK TRANSCRIPT
+{transcript}
+"""
 
 
 def run_ollama(
     cwd: str,
     control: pathlib.Path,
-    session_id: str | None,
     request: dict[str, Any] | None,
 ) -> tuple[str, str | None, int]:
     model = os.environ.get("CLAUDE_OLLAMA_MODEL", runtime.DEFAULT_MODEL)
@@ -209,21 +261,14 @@ def run_ollama(
         banner("FALLBACK NOT READY")
         print(detail, flush=True)
         print("Claude ended because of a provider limit, but Ollama is not ready. Fix Ollama and run `claude` again.", flush=True)
-        return "exit", session_id, 78
+        return "exit", None, 78
 
     permission_mode = os.environ.get("CLAUDE_OLLAMA_PERMISSION_MODE", "acceptEdits")
-    for name in ("return-request.json", "fallback-idle.json", "primary-ready.json"):
+    for name in ("return-request.json", "fallback-idle.json", "primary-ready.json", "current-session.json"):
         remove(control / name)
 
-    cmd = [real_claude(), "--model", model]
-    if permission_mode == "bypassPermissions":
-        cmd.append("--dangerously-skip-permissions")
-    else:
-        cmd.extend(["--permission-mode", permission_mode])
-    if session_id:
-        cmd.extend(["--resume", session_id, fallback_prompt(request)])
-    else:
-        cmd.append(fallback_prompt(request))
+    prompt = fallback_prompt(cwd, request)
+    cmd = build_ollama_command(model, permission_mode, prompt)
 
     banner(f"OLLAMA ACTIVE ({model}). CLAUDE CHECK EVERY {POLL_SECONDS}s")
     proc = spawn_visible(cmd, cwd, child_env(control, "ollama"))
@@ -236,15 +281,16 @@ def run_ollama(
     try:
         while proc.poll() is None:
             if return_path.exists() or (ready_path.exists() and idle_path.exists()):
+                handback = build_handback_prompt(cwd, control)
                 banner("CLAUDE AVAILABLE AGAIN. RETURNING AT SAFE CHECKPOINT")
                 stop_child(proc)
-                return "primary", session_id, 0
+                return "primary", handback, 0
             time.sleep(0.2)
     finally:
         stop_probe.set()
     if ready_path.exists():
-        return "primary", session_id, 0
-    return "exit", session_id, int(proc.returncode or 0)
+        return "primary", build_handback_prompt(cwd, control), 0
+    return "exit", None, int(proc.returncode or 0)
 
 
 def supervise(cwd: str, claude_args: list[str]) -> int:
@@ -261,29 +307,41 @@ def supervise(cwd: str, claude_args: list[str]) -> int:
     control.mkdir(parents=True, exist_ok=True)
     clean_control(control)
 
-    # Critical design rule: Claude starts even if Ollama is missing or broken.
-    # Ollama is checked lazily only after a real StopFailure requires fallback.
-    session_id: str | None = None
+    # Claude starts even if Ollama is missing. Ollama is checked only when needed.
+    # Anthropic and Ollama use separate Claude Code sessions to avoid cross-provider
+    # model metadata contamination. Continuity is transferred through transcript
+    # excerpts and the shared repository state.
+    primary_session_id: str | None = None
     request: dict[str, Any] | None = None
     provider = "primary"
     first_args = list(claude_args)
+    pending_handback: str | None = None
     heartbeat_stop = threading.Event()
     heartbeat = threading.Thread(target=heartbeat_loop, args=(control, heartbeat_stop), daemon=True)
     heartbeat.start()
     try:
         while True:
             if provider == "primary":
-                action, request, session_id, code = run_primary(str(cwd_path), control, session_id, first_args)
+                action, request, primary_session_id, code = run_primary(
+                    str(cwd_path),
+                    control,
+                    primary_session_id,
+                    first_args,
+                    pending_handback,
+                )
                 first_args = []
+                pending_handback = None
                 if action == "fallback":
                     provider = "ollama"
                     continue
                 return code
-            action, session_id, code = run_ollama(str(cwd_path), control, session_id, request)
+
+            action, handback, code = run_ollama(str(cwd_path), control, request)
             if action == "primary":
                 provider = "primary"
                 request = None
-                for name in ("primary-ready.json", "return-request.json", "fallback-idle.json"):
+                pending_handback = handback
+                for name in ("primary-ready.json", "return-request.json", "fallback-idle.json", "current-session.json"):
                     remove(control / name)
                 continue
             return code
