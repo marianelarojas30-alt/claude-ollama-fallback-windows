@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove the Claude -> Ollama Continuity hook and installed files."""
+"""Remove the Claude -> Ollama Continuity hooks and installed files."""
 from __future__ import annotations
 
 import json
@@ -22,12 +22,19 @@ def main() -> int:
     if SETTINGS.exists():
         data = json.loads(SETTINGS.read_text(encoding="utf-8-sig"))
         hooks = data.get("hooks", {})
-        entries = hooks.get("StopFailure", [])
-        filtered = [entry for entry in entries if APP not in json.dumps(entry)]
-        if filtered:
-            hooks["StopFailure"] = filtered
-        else:
-            hooks.pop("StopFailure", None)
+        for event in ("StopFailure", "Stop", "UserPromptSubmit"):
+            entries = hooks.get(event, [])
+            filtered = [
+                entry
+                for entry in entries
+                if APP not in json.dumps(entry)
+                and "continuity.py" not in json.dumps(entry)
+                and "supervisor_hook.py" not in json.dumps(entry)
+            ]
+            if filtered:
+                hooks[event] = filtered
+            else:
+                hooks.pop(event, None)
         SETTINGS.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if INSTALL_DIR.exists():
         shutil.rmtree(INSTALL_DIR)
