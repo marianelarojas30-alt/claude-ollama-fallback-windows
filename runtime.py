@@ -11,6 +11,7 @@ import subprocess
 from typing import Any
 
 APP = "claude-ollama-continuity"
+VERSION = "1.0.0"
 DEFAULT_MODEL = os.environ.get("CLAUDE_OLLAMA_MODEL", "qwen3.5")
 
 
@@ -57,7 +58,12 @@ def normalize_exec(cmd: list[str]) -> list[str]:
     return cmd
 
 
-def run_capture(cmd: list[str], cwd: str | None = None, timeout: int = 20, env: dict[str, str] | None = None) -> tuple[int, str]:
+def run_capture(
+    cmd: list[str],
+    cwd: str | None = None,
+    timeout: int = 20,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     try:
         proc = subprocess.run(
             normalize_exec(cmd),
@@ -139,26 +145,20 @@ def installed_models() -> tuple[bool, list[str], str]:
     return True, names, out
 
 
+def acceptable_model_names(model: str) -> set[str]:
+    if ":" in model:
+        return {model}
+    return {model, f"{model}:latest"}
+
+
 def model_available(model: str) -> tuple[bool, str]:
     ok, names, detail = installed_models()
     if not ok:
         return False, detail
-    base = model.split(":", 1)[0]
-    for name in names:
-        if name == model or name.split(":", 1)[0] == base:
-            return True, f"{model} is installed"
-    return False, f"{model} is not installed"
-
-
-def pull_model(model: str) -> tuple[bool, int]:
-    exe = ollama_executable()
-    if not exe:
-        return False, 127
-    try:
-        proc = subprocess.run(normalize_exec([exe, "pull", model]), check=False)
-        return proc.returncode == 0, proc.returncode
-    except OSError:
-        return False, 127
+    accepted = acceptable_model_names(model)
+    if any(name in accepted for name in names):
+        return True, f"{model} is installed"
+    return False, f"{model} is not installed (expected one of: {', '.join(sorted(accepted))})"
 
 
 def fallback_environment(control: pathlib.Path) -> dict[str, str]:
@@ -197,6 +197,9 @@ def primary_environment(control: pathlib.Path) -> dict[str, str]:
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
     if env.get("ANTHROPIC_API_KEY") == "":
         env.pop("ANTHROPIC_API_KEY", None)
-    if env.get("ANTHROPIC_BASE_URL", "").rstrip("/") in {"http://localhost:11434", "http://127.0.0.1:11434"}:
+    if env.get("ANTHROPIC_BASE_URL", "").rstrip("/") in {
+        "http://localhost:11434",
+        "http://127.0.0.1:11434",
+    }:
         env.pop("ANTHROPIC_BASE_URL", None)
     return env
