@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Installer for Claude -> Ollama Continuity."""
+"""Installer for Claude Ollama Continuity."""
 from __future__ import annotations
 
 import datetime as dt
@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 APP = "claude-ollama-continuity"
+PACKAGE_VERSION = "1.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path.home()
 CLAUDE_DIR = HOME / ".claude"
@@ -53,26 +54,6 @@ def atomic_write_json(path: pathlib.Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _ensure_hook(hooks: dict, event: str, target: pathlib.Path, matcher: str | None = None) -> None:
-    entries = hooks.setdefault(event, [])
-    marker = str(target)
-    if any(marker in json.dumps(entry) for entry in entries):
-        return
-    entry = {
-        "hooks": [
-            {
-                "type": "command",
-                "command": sys.executable,
-                "args": [str(target)],
-                "timeout": 10,
-            }
-        ]
-    }
-    if matcher is not None:
-        entry["matcher"] = matcher
-    entries.append(entry)
-
-
 def existing_real_claude() -> str | None:
     config = INSTALL_DIR / "config.json"
     if config.exists():
@@ -90,8 +71,10 @@ def find_real_claude() -> str:
     saved = existing_real_claude()
     if saved:
         return saved
-    path_parts = []
+    path_parts: list[str] = []
     for part in os.environ.get("PATH", "").split(os.pathsep):
+        if not part:
+            continue
         try:
             if pathlib.Path(part).resolve() == BIN_DIR.resolve():
                 continue
@@ -100,48 +83,14 @@ def find_real_claude() -> str:
         path_parts.append(part)
     candidate = shutil.which("claude", path=os.pathsep.join(path_parts))
     if not candidate:
-        raise SystemExit("Claude Code must be installed before Claude Ollama Continuity.")
+        raise SystemExit("Claude Code must already be installed before this continuity layer.")
     return str(pathlib.Path(candidate).resolve())
-
-
-def ensure_user_path_windows(directory: pathlib.Path) -> None:
-    if os.name != "nt":
-        return
-    current = os.environ.get("PATH", "")
-    target = str(directory)
-    if not any(piece.lower() == target.lower() for piece in current.split(os.pathsep) if piece):
-        os.environ["PATH"] = target + os.pathsep + current
-    try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        user_path = proc.stdout.strip()
-        entries = [p for p in user_path.split(";") if p]
-        entries = [p for p in entries if p.lower() != target.lower()]
-        new_path = ";".join([target, *entries])
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "[Environment]::SetEnvironmentVariable('Path', $args[0], 'User')",
-                new_path,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        print(f"WARNING: Could not add {target} to User PATH automatically.")
 
 
 def find_ollama_windows() -> pathlib.Path | None:
     if os.name != "nt":
-        return None
+        value = shutil.which("ollama")
+        return pathlib.Path(value) if value else None
     existing = shutil.which("ollama")
     if existing:
         return pathlib.Path(existing)
@@ -156,17 +105,95 @@ def find_ollama_windows() -> pathlib.Path | None:
     return None
 
 
+def ensure_user_path_windows(directory: pathlib.Path) -> None:
+    if os.name != "nt":
+        return
+    target = str(directory)
+    current = os.environ.get("PATH", "")
+    if not any(p and os.path.normcase(p.rstrip("\\/")) == os.path.normcase(target.rstrip("\\/")) for p in current.split(";")):
+        os.environ["PATH"] = target + ";" + current
+    script = (
+        "$target=$args[0];"
+        "$p=[Environment]::GetEnvironmentVariable('Path','User');"
+        "$parts=@($p -split ';' | Where-Object {$_ -and $_.TrimEnd('\\') -ine $target.TrimEnd('\\')});"
+        "[Environment]::SetEnvironmentVariable('Path',($target+';'+($parts -join ';')),'User')"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script, target],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit("Could not update User PATH: " + proc.stderr.strip())
+
+
+def remove_our_hooks(hooks: dict, marker: str) -> None:
+    for event in ("StopFailure", "Stop", "UserPromptSubmit"):
+        entries = hooks.get(event, [])
+        kept = [entry for entry in entries if marker not in json.dumps(entry) and APP not in json.dumps(entry)]
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+
+
+def add_hook(hooks: dict, event: str, target: pathlib.Path, matcher: str | None = None) -> None:
+    entry: dict = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": sys.executable,
+                "args": [str(target)],
+                "timeout": 10,
+            }
+        ]
+    }
+    if matcher is not None:
+        entry["matcher"] = matcher
+    hooks.setdefault(event, []).append(entry)
+
+
+def write_launchers(real_claude: str) -> None:
+    control = INSTALL_DIR / "control.py"
+    supervisor = INSTALL_DIR / "supervisor.py"
+    updater = INSTALL_DIR / "updater.py"
+
+    if os.name == "nt":
+        (BIN_DIR / "claude-continuity.cmd").write_text(
+            f'@echo off\r\n'
+            f'if /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
+            f'"{sys.executable}" "{control}" %*\r\n',
+            encoding="utf-8",
+        )
+        (BIN_DIR / "claude.cmd").write_text(
+            f'@echo off\r\n'
+            f'if "%CLAUDE_CONTINUITY_INTERNAL%"=="1" (\r\n  "{real_claude}" %*\r\n) else (\r\n  "{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n)\r\n',
+            encoding="utf-8",
+        )
+        ensure_user_path_windows(BIN_DIR)
+    else:
+        continuity_launcher = BIN_DIR / "claude-continuity"
+        continuity_launcher.write_text(
+            f'#!/bin/sh\nif [ "$1" = "update" ]; then exec "{sys.executable}" "{updater}"; fi\nexec "{sys.executable}" "{control}" "$@"\n',
+            encoding="utf-8",
+        )
+        continuity_launcher.chmod(0o755)
+        claude_launcher = BIN_DIR / "claude"
+        claude_launcher.write_text(
+            f'#!/bin/sh\nif [ "$CLAUDE_CONTINUITY_INTERNAL" = "1" ]; then exec "{real_claude}" "$@"; fi\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD" -- "$@"\n',
+            encoding="utf-8",
+        )
+        claude_launcher.chmod(0o755)
+
+
 def verify_installed_runtime() -> None:
     missing = [name for name in RUNTIME_FILES if not (INSTALL_DIR / name).exists()]
     if missing:
         raise SystemExit("INSTALL VERIFY FAILED: missing " + ", ".join(missing))
-
     proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import runtime, supervisor, supervisor_hook, control; print('runtime import OK')",
-        ],
+        [sys.executable, "-c", "import continuity,runtime,supervisor,supervisor_hook,control; print('runtime import OK')"],
         cwd=str(INSTALL_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -174,7 +201,11 @@ def verify_installed_runtime() -> None:
         check=False,
     )
     if proc.returncode != 0:
-        raise SystemExit("INSTALL VERIFY FAILED: " + (proc.stdout.strip() or "runtime import error"))
+        raise SystemExit("INSTALL VERIFY FAILED: " + (proc.stdout.strip() or "import error"))
+    if os.name == "nt":
+        for name in ("claude.cmd", "claude-continuity.cmd"):
+            if not (BIN_DIR / name).exists():
+                raise SystemExit(f"INSTALL VERIFY FAILED: missing launcher {name}")
     print("Runtime verification: OK")
 
 
@@ -185,20 +216,8 @@ def main() -> int:
 
     real_claude = find_real_claude()
     ollama_exe = find_ollama_windows()
-    if os.name == "nt" and ollama_exe is not None:
+    if ollama_exe is not None and os.name == "nt":
         ensure_user_path_windows(ollama_exe.parent)
-        print(f"Ollama found:      {ollama_exe}")
-    elif os.name == "nt":
-        print("WARNING: Ollama not found. Claude will still start; fallback will report not ready if needed.")
-
-    atomic_write_json(
-        INSTALL_DIR / "config.json",
-        {
-            "real_claude": real_claude,
-            "ollama_exe": str(ollama_exe) if ollama_exe else None,
-            "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
-        },
-    )
 
     for name in RUNTIME_FILES:
         source = ROOT / name
@@ -206,97 +225,48 @@ def main() -> int:
             raise SystemExit(f"Installer source missing required file: {name}")
         shutil.copy2(source, INSTALL_DIR / name)
 
-    target = INSTALL_DIR / "continuity.py"
-    runtime_target = INSTALL_DIR / "runtime.py"
-    supervisor = INSTALL_DIR / "supervisor.py"
-    hook_target = INSTALL_DIR / "supervisor_hook.py"
-    control = INSTALL_DIR / "control.py"
-    updater = INSTALL_DIR / "updater.py"
-
     if os.name != "nt":
-        for path in (target, runtime_target, supervisor, hook_target, control, updater):
+        for name in RUNTIME_FILES:
+            path = INSTALL_DIR / name
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    if os.name == "nt":
-        continuity_launcher = BIN_DIR / "claude-continuity.cmd"
-        continuity_launcher.write_text(
-            f'@echo off\r\n'
-            f'if /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
-            f'if /I "%~1"=="simulate-limit" (\r\n  "{sys.executable}" "{control}" simulate-limit\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
-            f'if /I "%~1"=="simulate-recovery" (\r\n  "{sys.executable}" "{control}" simulate-recovery\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
-            f'if /I "%~1"=="supervisor-status" (\r\n  "{sys.executable}" "{control}" supervisor-status\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
-            f'"{sys.executable}" "{target}" %*\r\n',
-            encoding="utf-8",
-        )
-        smart_launcher = BIN_DIR / "smart-claude.cmd"
-        smart_launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n',
-            encoding="utf-8",
-        )
-        global_claude = BIN_DIR / "claude.cmd"
-        global_claude.write_text(
-            f'@echo off\r\nif "%CLAUDE_CONTINUITY_INTERNAL%"=="1" (\r\n  "{real_claude}" %*\r\n) else (\r\n  "{sys.executable}" "{supervisor}" --cwd "%CD%" -- %*\r\n)\r\n',
-            encoding="utf-8",
-        )
-        ensure_user_path_windows(BIN_DIR)
-    else:
-        continuity_launcher = BIN_DIR / "claude-continuity"
-        continuity_launcher.write_text(
-            f'#!/bin/sh\n'
-            f'case "$1" in\n'
-            f'  update) exec "{sys.executable}" "{updater}" ;;\n'
-            f'  simulate-limit|simulate-recovery|supervisor-status) exec "{sys.executable}" "{control}" "$1" ;;\n'
-            f'esac\n'
-            f'exec "{sys.executable}" "{target}" "$@"\n',
-            encoding="utf-8",
-        )
-        continuity_launcher.chmod(0o755)
-        smart_launcher = BIN_DIR / "smart-claude"
-        smart_launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{supervisor}" --cwd "$PWD" -- "$@"\n',
-            encoding="utf-8",
-        )
-        smart_launcher.chmod(0o755)
-        global_claude = smart_launcher
+    write_launchers(real_claude)
 
     data = load_settings()
     hooks = data.setdefault("hooks", {})
-    legacy_markers = (str(target), str(hook_target), APP)
-    for event in ("StopFailure", "Stop", "UserPromptSubmit"):
-        entries = hooks.get(event, [])
-        hooks[event] = [
-            entry for entry in entries
-            if not any(marker in json.dumps(entry) for marker in legacy_markers)
-        ]
-        if not hooks[event]:
-            hooks.pop(event, None)
-
-    _ensure_hook(
-        hooks,
-        "StopFailure",
-        hook_target,
-        "rate_limit|billing_error|server_error|max_output_tokens",
-    )
-    _ensure_hook(hooks, "Stop", hook_target)
-    _ensure_hook(hooks, "UserPromptSubmit", hook_target)
+    hook_target = INSTALL_DIR / "supervisor_hook.py"
+    remove_our_hooks(hooks, str(hook_target))
+    add_hook(hooks, "StopFailure", hook_target, "rate_limit|billing_error|server_error|max_output_tokens")
+    add_hook(hooks, "Stop", hook_target)
+    add_hook(hooks, "UserPromptSubmit", hook_target)
 
     if SETTINGS.exists():
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = SETTINGS.with_name(f"settings.json.continuity-backup-{stamp}")
         shutil.copy2(SETTINGS, backup)
         print(f"Backup: {backup}")
-
     atomic_write_json(SETTINGS, data)
-    verify_installed_runtime()
 
+    atomic_write_json(
+        INSTALL_DIR / "config.json",
+        {
+            "version": PACKAGE_VERSION,
+            "installed_commit": os.environ.get("CLAUDE_CONTINUITY_COMMIT"),
+            "real_claude": real_claude,
+            "ollama_exe": str(ollama_exe) if ollama_exe else None,
+            "repository": "marianelarojas30-alt/claude-ollama-fallback-windows",
+        },
+    )
+
+    verify_installed_runtime()
     print("\nINSTALLED / UPDATED OK")
+    print(f"Version:          {PACKAGE_VERSION}")
+    print(f"Installed commit: {os.environ.get('CLAUDE_CONTINUITY_COMMIT') or '(local install)'}")
     print(f"Real Claude:      {real_claude}")
-    print(f"Global wrapper:   {global_claude}")
-    print(f"Supervisor:       {supervisor}")
-    print(f"Settings:         {SETTINGS}")
-    print("\nOpen a NEW terminal. From then on use: claude")
-    print("Future upgrades: claude-continuity update")
-    print("Test commands:   claude-continuity simulate-limit / simulate-recovery")
+    print(f"Ollama:           {ollama_exe or '(not found yet)'}")
+    print(f"Global wrapper:   {BIN_DIR / ('claude.cmd' if os.name == 'nt' else 'claude')}")
+    print("\nOpen a NEW terminal, then run: claude-continuity doctor")
+    print("Normal use after that: claude")
     return 0
 
 
