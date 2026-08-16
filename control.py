@@ -48,7 +48,7 @@ def active_control() -> pathlib.Path:
             epoch = float(heartbeat.get("epoch", 0))
         except (TypeError, ValueError):
             epoch = 0
-        if epoch and now - epoch <= HEARTBEAT_MAX_AGE:
+        if epoch and 0 <= now - epoch <= HEARTBEAT_MAX_AGE:
             candidates.append((epoch, path))
 
     if not candidates:
@@ -90,10 +90,11 @@ def simulate_recovery() -> int:
         "probe": "SIMULATION ONLY: forced Claude recovery",
         "simulated": True,
     }
+    # Match real recovery behavior. Only mark Anthropic as reachable.
+    # The supervisor returns after Ollama reaches its next Stop/idle checkpoint.
     write_signal(root, "primary-ready.json", payload)
-    write_signal(root, "return-request.json", payload)
     print("SIMULATED RECOVERY SENT")
-    print("Watch the terminal where `claude` is running. It should return to CLAUDE ACTIVE.")
+    print("Claude is marked available. Ollama will return at its next safe Stop/idle checkpoint.")
     return 0
 
 
