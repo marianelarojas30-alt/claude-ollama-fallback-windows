@@ -18,6 +18,7 @@ REPOSITORY = os.environ.get(
 BRANCH = os.environ.get("CLAUDE_CONTINUITY_BRANCH", "main")
 REQUIRED_FILES = [
     "continuity.py",
+    "runtime.py",
     "supervisor.py",
     "supervisor_hook.py",
     "control.py",
