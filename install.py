@@ -234,6 +234,15 @@ def verify_installed_runtime() -> None:
 
 
 def main() -> int:
+    for protected_path, label in (
+        (INSTALL_DIR, "install directory"),
+        (BIN_DIR, "bin directory"),
+        (CLAUDE_DIR, "Claude config directory"),
+        (SETTINGS, "Claude settings file"),
+    ):
+        if protected_path.is_symlink():
+            raise SystemExit(f"INSTALL REFUSED: {label} is a symlink: {protected_path}")
+
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,7 +256,10 @@ def main() -> int:
         source = ROOT / name
         if not source.exists():
             raise SystemExit(f"Installer source missing required file: {name}")
-        shutil.copy2(source, INSTALL_DIR / name)
+        destination = INSTALL_DIR / name
+        if destination.is_symlink():
+            raise SystemExit(f"INSTALL REFUSED: runtime destination is a symlink: {destination}")
+        shutil.copy2(source, destination)
 
     if os.name != "nt":
         for name in RUNTIME_FILES:
