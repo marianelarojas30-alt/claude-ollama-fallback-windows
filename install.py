@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 APP = "claude-ollama-continuity"
-PACKAGE_VERSION = "1.0.1"
+PACKAGE_VERSION = "1.1.0"
 ROOT = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path.home()
 CLAUDE_DIR = HOME / ".claude"
