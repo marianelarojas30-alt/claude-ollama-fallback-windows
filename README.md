@@ -47,13 +47,15 @@ Official references:
 
 ## Install or repair
 
-Run this once in PowerShell:
+Recommended secure install:
 
 ```powershell
-$u="$env:TEMP\claude-continuity-updater.py"; Invoke-WebRequest "https://raw.githubusercontent.com/marianelarojas30-alt/claude-ollama-fallback-windows/main/updater.py?cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" -OutFile $u; py $u
+git clone https://github.com/marianelarojas30-alt/claude-ollama-fallback-windows.git
+cd claude-ollama-fallback-windows
+py updater.py
 ```
 
-The updater resolves one exact Git commit first and downloads every runtime file from that same commit. A valid install must print:
+This avoids executing a Python file directly from a mutable `main` URL. You can inspect the downloaded repository before running it. The updater then resolves one exact Git commit and downloads every runtime file from that same commit. A valid install must print:
 
 ```text
 Runtime verification: OK
