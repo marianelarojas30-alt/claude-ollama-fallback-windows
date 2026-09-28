@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+import urllib.parse
 
-REPOSITORY = os.environ.get(
-    "CLAUDE_CONTINUITY_REPOSITORY",
-    "marianelarojas30-alt/claude-ollama-fallback-windows",
-)
-BRANCH = os.environ.get("CLAUDE_CONTINUITY_BRANCH", "main")
+TRUSTED_REPOSITORY = "marianelarojas30-alt/claude-ollama-fallback-windows"
+DEFAULT_BRANCH = "main"
+REPOSITORY = os.environ.get("CLAUDE_CONTINUITY_REPOSITORY", TRUSTED_REPOSITORY)
+BRANCH = os.environ.get("CLAUDE_CONTINUITY_BRANCH", DEFAULT_BRANCH)
+ALLOW_CUSTOM_SOURCE = os.environ.get("CLAUDE_CONTINUITY_ALLOW_CUSTOM_SOURCE") == "1"
 FILES = [
     "continuity.py",
     "runtime.py",
@@ -40,16 +42,27 @@ def request_bytes(url: str, timeout: int = 30) -> bytes:
         return response.read()
 
 
+def validate_source() -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPOSITORY):
+        raise RuntimeError("invalid GitHub repository name")
+    if (REPOSITORY != TRUSTED_REPOSITORY or BRANCH != DEFAULT_BRANCH) and not ALLOW_CUSTOM_SOURCE:
+        raise RuntimeError(
+            "custom update source blocked; set CLAUDE_CONTINUITY_ALLOW_CUSTOM_SOURCE=1 only after reviewing the source"
+        )
+
+
 def resolve_commit() -> str:
-    url = f"https://api.github.com/repos/{REPOSITORY}/commits/{BRANCH}"
+    validate_source()
+    branch = urllib.parse.quote(BRANCH, safe="")
+    url = f"https://api.github.com/repos/{REPOSITORY}/commits/{branch}"
     try:
         payload = json.loads(request_bytes(url).decode("utf-8"))
         sha = str(payload.get("sha") or "")
     except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"could not resolve {REPOSITORY}@{BRANCH}: {exc}") from exc
-    if len(sha) < 40:
-        raise RuntimeError("GitHub did not return a valid commit SHA")
-    return sha
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        raise RuntimeError("GitHub did not return a valid 40-character commit SHA")
+    return sha.lower()
 
 
 def download_commit(commit: str, root: pathlib.Path) -> None:

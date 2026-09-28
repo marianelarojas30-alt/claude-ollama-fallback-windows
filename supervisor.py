@@ -118,13 +118,13 @@ def heartbeat_loop(control: pathlib.Path, cwd: str, stop_event: threading.Event)
 
 
 def fallback_readiness(model: str) -> tuple[bool, str]:
-    ok, detail = runtime.ollama_available()
+    ok, names, detail = runtime.installed_models()
     if not ok:
         return False, detail
-    ok, detail = runtime.model_available(model)
-    if not ok:
-        return False, detail + f". Run: ollama pull {model}"
-    return True, detail
+    accepted = runtime.acceptable_model_names(model)
+    if not any(name in accepted for name in names):
+        return False, f"{model} is not installed. Run: ollama pull {model}"
+    return True, f"{model} is installed"
 
 
 def build_primary_command(

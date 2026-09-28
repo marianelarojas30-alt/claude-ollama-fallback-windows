@@ -26,13 +26,12 @@ class SupervisorBehaviorTests(unittest.TestCase):
                 primary.assert_called_once()
                 fallback.assert_not_called()
 
-    def test_fallback_readiness_checks_ollama_only_when_needed(self):
-        with mock.patch.object(supervisor.runtime, "ollama_available", return_value=(False, "missing")), \
-             mock.patch.object(supervisor.runtime, "model_available") as model:
+    def test_fallback_readiness_uses_single_model_listing(self):
+        with mock.patch.object(supervisor.runtime, "installed_models", return_value=(False, [], "missing")) as listing:
             ok, detail = supervisor.fallback_readiness("qwen3.5")
             self.assertFalse(ok)
             self.assertEqual(detail, "missing")
-            model.assert_not_called()
+            listing.assert_called_once()
 
     def test_no_separate_anthropic_probe_exists(self):
         self.assertFalse(hasattr(supervisor, "probe_primary"))
