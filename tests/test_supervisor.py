@@ -109,7 +109,7 @@ class ControlBehaviorTests(unittest.TestCase):
         return path
 
     def test_stale_supervisor_is_ignored(self):
-        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir, "CLAUDE_OLLAMA_STATE_DIR": tempdir}, clear=False):
             root = control.state_dir() / "supervisor"
             stale = root / "111"
             stale.mkdir(parents=True)
@@ -118,7 +118,7 @@ class ControlBehaviorTests(unittest.TestCase):
             self.assertEqual(control.active_control(), live)
 
     def test_multiple_live_sessions_refuse_to_guess(self):
-        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir, "CLAUDE_OLLAMA_STATE_DIR": tempdir}, clear=False):
             root = control.state_dir() / "supervisor"
             self._live(root, "111", "C:/one")
             self._live(root, "222", "C:/two")
@@ -127,7 +127,7 @@ class ControlBehaviorTests(unittest.TestCase):
             self.assertEqual(control.active_control(222).name, "222")
 
     def test_simulated_recovery_requests_real_interactive_retry(self):
-        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir}, clear=False):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(os.environ, {"LOCALAPPDATA": tempdir, "CLAUDE_OLLAMA_STATE_DIR": tempdir}, clear=False):
             root = control.state_dir() / "supervisor"
             live = self._live(root, "222", "C:/repo")
             self.assertEqual(control.simulate_recovery(222), 0)

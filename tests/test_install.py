@@ -9,6 +9,7 @@ import install
 
 
 class InstallerSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "install.py writes the .cmd launchers only on Windows")
     def test_install_copies_complete_runtime_and_writes_launchers_and_hooks(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
