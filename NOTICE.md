@@ -6,4 +6,4 @@ Original code, documentation, and other contributions authored by Marianela Bour
 
 Third-party code, dependencies, assets, and contributions by other authors retain their respective copyright, attribution, and license terms.
 
-This notice does not replace or override any existing open-source license in this repository.
+This notice does not replace or override the LICENSE file in this repository.
