@@ -9,6 +9,8 @@ import pathlib
 import sys
 from typing import Any
 
+import runtime
+
 SUPPORTED_ERRORS = {
     "rate_limit",
     "billing_error",
@@ -34,10 +36,7 @@ def write_signal(name: str, payload: dict[str, Any]) -> None:
     root = control_dir()
     if root is None:
         return
-    tmp = root / f"{name}.tmp"
-    final = root / name
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, final)
+    runtime.write_json_atomic(root / name, payload)
 
 
 def remove_signal(name: str) -> None:

@@ -100,9 +100,7 @@ def stop_child(proc: subprocess.Popen[Any], grace: float = 5.0) -> None:
 
 
 def write_json_atomic(path: pathlib.Path, payload: dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    runtime.write_json_atomic(path, payload)
 
 
 def heartbeat_loop(control: pathlib.Path, cwd: str, stop_event: threading.Event) -> None:

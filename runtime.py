@@ -8,6 +8,8 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
+import time
 from typing import Any
 
 APP = "claude-ollama-continuity"
@@ -44,6 +46,42 @@ def read_json(path: pathlib.Path) -> dict[str, Any] | None:
         return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def write_json_atomic(path: pathlib.Path, payload: dict[str, Any], *, trailing_newline: bool = False) -> None:
+    """Replace ``path`` with ``payload`` as JSON so readers never see a partial file.
+
+    Each call writes to its own uniquely named temporary file in the same directory
+    and then renames it over the target, so concurrent writers (several sessions, the
+    heartbeat thread and the hook) cannot clobber each other's temporary file. On
+    Windows the rename is refused while another process is replacing or reading the
+    same target, so it is retried briefly before giving up. The temporary file is
+    removed if anything fails.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + ("\n" if trailing_newline else "")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        _replace_with_retry(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _replace_with_retry(src: str, dst: pathlib.Path, attempts: int = 50, delay: float = 0.01) -> None:
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def config() -> dict[str, Any]:
