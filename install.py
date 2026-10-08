@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 
+import runtime
+
 APP = "claude-ollama-continuity"
 PACKAGE_VERSION = "1.1.0"
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -49,9 +51,7 @@ def load_settings() -> dict:
 
 
 def atomic_write_json(path: pathlib.Path, data: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    runtime.write_json_atomic(path, data, trailing_newline=True)
 
 
 def existing_real_claude() -> str | None:

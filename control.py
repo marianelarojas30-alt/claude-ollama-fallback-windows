@@ -92,11 +92,7 @@ def active_control(pid: int | None = None) -> pathlib.Path:
 
 
 def write_signal(root: pathlib.Path, name: str, payload: dict[str, Any]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = root / f"{name}.tmp"
-    final = root / name
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, final)
+    runtime.write_json_atomic(root / name, payload)
 
 
 def simulate_limit(pid: int | None = None) -> int:
