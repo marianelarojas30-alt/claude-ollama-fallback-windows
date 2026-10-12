@@ -92,12 +92,16 @@ def git_snapshot(cwd: str) -> str:
     git = shutil.which("git")
     if not git:
         return "git not installed"
-    if _capture([git, "rev-parse", "--is-inside-work-tree"], cwd).strip() != "true":
+    # Snapshotting an untrusted repository must not run its fsmonitor or diff
+    # helpers. Command-line config takes precedence over repository/global config.
+    safe_git = [git, "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=",
+                "-c", "diff.external=", "-c", "core.pager=cat"]
+    if _capture([*safe_git, "rev-parse", "--is-inside-work-tree"], cwd).strip() != "true":
         return "Not a git work tree."
     return "\n\n".join(
         [
-            "## git status --short\n" + _capture([git, "status", "--short"], cwd),
-            "## git diff --stat\n" + _capture([git, "diff", "--stat"], cwd),
-            "## recent commits\n" + _capture([git, "log", "-5", "--oneline", "--decorate"], cwd),
+            "## git status --short\n" + _capture([*safe_git, "status", "--short"], cwd),
+            "## git diff --stat\n" + _capture([*safe_git, "diff", "--no-ext-diff", "--no-textconv", "--stat"], cwd),
+            "## recent commits\n" + _capture([*safe_git, "log", "--no-show-signature", "-5", "--oneline", "--decorate"], cwd),
         ]
     )
