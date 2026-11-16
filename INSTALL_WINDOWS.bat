@@ -5,20 +5,19 @@ echo ==============================================
 echo  Claude Ollama Continuity 1.0 - Windows Setup
 echo ==============================================
 echo.
+set "PYTHON_RUNNER=py -3"
 where py >nul 2>nul
-if %errorlevel%==0 (
-  py -3 install.py
-  set INSTALL_RC=%errorlevel%
-) else (
+if errorlevel 1 (
   where python >nul 2>nul
-  if not %errorlevel%==0 (
+  if errorlevel 1 (
     echo ERROR: Python 3 was not found in PATH.
     pause
     exit /b 2
   )
-  python install.py
-  set INSTALL_RC=%errorlevel%
+  set "PYTHON_RUNNER=python"
 )
+%PYTHON_RUNNER% install.py
+set "INSTALL_RC=%errorlevel%"
 if not %INSTALL_RC%==0 (
   echo.
   echo Installation failed. Copy the error above.
@@ -32,3 +31,4 @@ echo   ollama pull qwen3.5
 echo   claude-continuity doctor
 echo Normal use after READY: claude
 pause
+exit /b 0

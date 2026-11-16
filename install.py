@@ -186,9 +186,13 @@ def write_launchers(real_claude: str) -> None:
 
     if os.name == "nt":
         (BIN_DIR / "claude-continuity.cmd").write_text(
-            f'@echo off\r\n'
-            f'if /I "%~1"=="update" (\r\n  "{sys.executable}" "{updater}"\r\n  exit /b %ERRORLEVEL%\r\n)\r\n'
-            f'"{sys.executable}" "{control}" %*\r\n',
+            f'@echo off\n'
+            f'if /I "%~1"=="update" goto update\n'
+            f'"{sys.executable}" "{control}" %*\n'
+            f'exit /b %errorlevel%\n'
+            f':update\n'
+            f'"{sys.executable}" "{updater}"\n'
+            f'exit /b %errorlevel%\n',
             encoding="utf-8",
         )
         (BIN_DIR / "claude.cmd").write_text(
