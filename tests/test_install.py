@@ -1,6 +1,9 @@
 import json
 import os
 import pathlib
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -9,6 +12,40 @@ import install
 
 
 class InstallerSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_batch_setup_reports_the_installer_exit_status(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            shutil.copyfile(install.ROOT / "INSTALL_WINDOWS.bat", root / "INSTALL_WINDOWS.bat")
+            # Exercise the documented python.exe fallback, even on runners that have py.exe.
+            system32 = pathlib.Path(os.environ["SystemRoot"]) / "System32"
+            env = {**os.environ, "PATH": os.pathsep.join((str(pathlib.Path(sys.executable).parent), str(system32)))}
+            for expected in (19, 0):
+                with self.subTest(expected=expected):
+                    (root / "install.py").write_text(f"raise SystemExit({expected})", encoding="utf-8")
+                    result = subprocess.run(
+                        [os.environ["COMSPEC"], "/d", "/c", "INSTALL_WINDOWS.bat"],
+                        cwd=root, env=env, input=b"\n", capture_output=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(b"Installation complete." in result.stdout, expected == 0)
+
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_update_launcher_propagates_updater_failure(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            with mock.patch.object(install, "INSTALL_DIR", root), \
+                 mock.patch.object(install, "BIN_DIR", root), \
+                 mock.patch.object(install, "ensure_user_path_windows"):
+                install.write_launchers("unused")
+
+            (root / "updater.py").write_text("raise SystemExit(23)", encoding="utf-8")
+            result = subprocess.run(
+                [os.environ["COMSPEC"], "/d", "/c", "claude-continuity.cmd", "update"],
+                cwd=root, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+
     @unittest.skipUnless(os.name == "nt", "install.py writes the .cmd launchers only on Windows")
     def test_install_copies_complete_runtime_and_writes_launchers_and_hooks(self):
         with tempfile.TemporaryDirectory() as tempdir:
